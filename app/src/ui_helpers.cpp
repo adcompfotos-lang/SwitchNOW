@@ -319,7 +319,6 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                           "Renewing authorization and checking previous sessions.", 0.10f);
             SessionInfo info;
             try {
-                bg_client.CleanupStaleCloudSession(bg_auth);
                 post_progress(1, "Requesting a cloud rig",
                               "GeForce NOW is allocating hardware for your game.", 0.24f);
                 info = bg_client.StartSession(bg_auth, bg_app_id, bg_store, bg_internal_title);
@@ -338,7 +337,6 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     return;
                 post_progress(1, "Account restored - requesting a rig",
                               "Quick sign-in completed successfully.", 0.26f);
-                bg_client.CleanupStaleCloudSession(bg_auth);
                 info = bg_client.StartSession(bg_auth, bg_app_id, bg_store, bg_internal_title);
             }
             {

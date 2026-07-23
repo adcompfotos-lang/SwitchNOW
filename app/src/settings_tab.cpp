@@ -712,7 +712,7 @@ void SettingsTab::BuildInterfacePage()
     content_container_->addView(language);
 
     auto* about = MakeSection("SwitchNOW", "Native GeForce NOW client for Nintendo Switch.");
-    AddInfoLine(about, "Version", "1.0.0");
+    AddInfoLine(about, "Version", "1.0.1");
     AddInfoLine(about, "Languages", "English + 7");
     content_container_->addView(about);
 }

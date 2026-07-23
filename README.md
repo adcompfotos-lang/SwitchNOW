@@ -174,7 +174,7 @@ build/switch/SwitchNOW.nro
 Create a conventional release archive:
 
 ```powershell
-.\scripts\package-release.ps1 -Version 1.0.0
+.\scripts\package-release.ps1 -Version 1.0.1
 ```
 
 ## Source layout

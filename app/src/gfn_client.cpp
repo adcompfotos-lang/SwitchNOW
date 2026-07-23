@@ -1,4 +1,6 @@
 #include "gfn_client.hpp"
+#include "cloud_session_policy.hpp"
+#include "device_identity.hpp"
 #include "play_history.hpp"
 
 #ifdef __SWITCH__
@@ -847,6 +849,13 @@ std::string BuildCloudMatchErrorMessage(const std::string& stage, int http_statu
         message += "\nThis game is not available with the current GeForce NOW membership. "
                    "If the game page says Premium, upgrade the membership to play it.";
     }
+    if (request_status && cloud_session::IsDeviceLimitError(
+            GetInteger(request_status, "statusCode"),
+            GetString(request_status, "statusDescription"))) {
+        message += "\nGeForce NOW still reports another session for this device. "
+                   "SwitchNOW tried to close it automatically. Wait about a minute and retry "
+                   "if NVIDIA is still releasing the previous cloud rig.";
+    }
     return message + SessionTraceHint();
 }
 
@@ -857,6 +866,38 @@ bool IsAppPatchingResponse(json_t* root)
         return false;
 
     return GetString(request_status, "statusDescription").find("APP_PATCHING_STATUS") != std::string::npos;
+}
+
+bool IsDeviceSessionLimitResponse(json_t* root)
+{
+    json_t* request_status = root ? json_object_get(root, "requestStatus") : nullptr;
+    return request_status && cloud_session::IsDeviceLimitError(
+        GetInteger(request_status, "statusCode"),
+        GetString(request_status, "statusDescription"));
+}
+
+std::string GetSessionServerIp(json_t* session)
+{
+    if (!session || !json_is_object(session))
+        return {};
+
+    json_t* connections = json_object_get(session, "connectionInfo");
+    if (json_is_array(connections))
+    {
+        size_t index = 0;
+        json_t* connection = nullptr;
+        json_array_foreach(connections, index, connection)
+        {
+            if (GetInteger(connection, "usage") != 14)
+                continue;
+
+            const std::string ip = GetConnectionIp(connection);
+            if (!ip.empty())
+                return ip;
+        }
+    }
+
+    return GetString(json_object_get(session, "sessionControlInfo"), "ip");
 }
 
 void ApplySeatSetupInfo(json_t* sess, SessionInfo& info)
@@ -2257,6 +2298,13 @@ std::string BuildSteamImageUrl(const std::string& steam_url)
 }
 
 } // namespace
+
+GfnClient::GfnClient()
+    : device_id_(NormalizeCloudDeviceId(GenerateDeviceId()))
+{
+    if (device_id_.empty())
+        throw std::runtime_error("Unable to create a stable GeForce NOW device identity");
+}
 
 std::vector<LoginProvider> GfnClient::FetchLoginProviders() const
 {
@@ -4019,6 +4067,9 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
     ResetSessionTraceLog("StartSession appId=" + launch_app_id +
                          " store=" + (launch_store.empty() ? "unknown" : launch_store) +
                          " internalTitle=" + (internal_title.empty() ? "missing" : internal_title));
+    CleanupStaleCloudSession(session);
+    jwt_token = ResolveSessionJwt(session);
+    headers[0] = "Authorization: GFNJWT " + jwt_token;
     AppendSessionTraceLog("START url=" + url);
     AppendSessionTraceLog(
         "START settings=" + std::to_string(stream_settings.width) + "x" +
@@ -4043,11 +4094,28 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
     AppendSessionTraceLog("START response HTTP " + std::to_string(response.status_code));
     AppendSessionTraceLog("START response body:\n" + JsonForTrace(response.body));
 
-    JsonPtr root(nullptr, &json_decref);
-    try {
-        root = LoadJson(response.body);
-    } catch (const std::exception& e) {
-        AppendSessionTraceLog(std::string("START JSON parse error: ") + e.what());
+    auto parse_start_response = [&response]() -> JsonPtr {
+        try {
+            return LoadJson(response.body);
+        } catch (const std::exception& e) {
+            AppendSessionTraceLog(std::string("START JSON parse error: ") + e.what());
+            return JsonPtr(nullptr, &json_decref);
+        }
+    };
+    JsonPtr root = parse_start_response();
+
+    if (root && IsDeviceSessionLimitResponse(root.get()))
+    {
+        AppendSessionTraceLog(
+            "START device session limit detected; refreshing the server session list, "
+            "cleaning matching sessions and retrying once");
+        CleanupStaleCloudSession(session);
+        jwt_token = ResolveSessionJwt(session);
+        headers[0] = "Authorization: GFNJWT " + jwt_token;
+        response = http_client_.Post(url, kUserAgent, headers, body);
+        AppendSessionTraceLog("START retry response HTTP " + std::to_string(response.status_code));
+        AppendSessionTraceLog("START retry response body:\n" + JsonForTrace(response.body));
+        root = parse_start_response();
     }
 
     const bool app_patching = root && IsAppPatchingResponse(root.get());
@@ -4224,12 +4292,23 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
     return info;
 }
 
-void GfnClient::StopSession(AuthSession& session, const std::string& session_id) const
+void GfnClient::StopSession(
+    AuthSession& session,
+    const std::string& session_id,
+    const std::string& server_ip) const
 {
     session = EnsureFreshSavedSession(session);
     std::string jwt_token = ResolveSessionJwt(session);
     const std::string device_id = device_id_;
-    std::string url = session.provider.streaming_service_url + "v2/session/" + session_id;
+    std::string base_url = session.provider.streaming_service_url;
+    if (!server_ip.empty())
+    {
+        base_url = HasPrefix(server_ip, "https://") || HasPrefix(server_ip, "http://")
+            ? server_ip
+            : "https://" + server_ip;
+        base_url = EnsureTrailingSlash(base_url);
+    }
+    std::string url = base_url + "v2/session/" + session_id;
 
     std::vector<std::string> headers = {
         "Authorization: GFNJWT " + jwt_token,
@@ -4271,11 +4350,123 @@ void GfnClient::StopSession(AuthSession& session, const std::string& session_id)
 void GfnClient::CleanupStaleCloudSession(AuthSession& session) const
 {
     const std::string stale_session_id = LoadActiveCloudSessionId(session);
-    if (stale_session_id.empty())
-        return;
+    session = EnsureFreshSavedSession(session);
+    std::string jwt_token = ResolveSessionJwt(session);
+    const std::string list_url = session.provider.streaming_service_url + "v2/session";
+    std::vector<std::string> headers = {
+        "Authorization: GFNJWT " + jwt_token,
+        "nv-client-id: " + client_id_,
+        "nv-browser-type: CHROME",
+        "nv-client-streamer: NVIDIA-CLASSIC",
+        "nv-client-type: NATIVE",
+        "nv-client-version: 30.0",
+        "nv-device-make: UNKNOWN",
+        "nv-device-model: UNKNOWN",
+        "nv-device-os: WINDOWS",
+        "nv-device-type: DESKTOP",
+        "x-device-id: " + device_id_,
+        "Content-Type: application/json"
+    };
 
-    AppendAuthLog("session: cleaning stale CloudMatch session before launch");
-    StopSession(session, stale_session_id);
+    AppendSessionTraceLog("CLEANUP list url=" + list_url);
+    HttpResponse response = http_client_.Get(list_url, kUserAgent, headers);
+    if (response.status_code == 401)
+    {
+        session = ForceRefreshSavedSession(session);
+        jwt_token = ResolveSessionJwt(session);
+        headers[0] = "Authorization: GFNJWT " + jwt_token;
+        AppendSessionTraceLog(
+            "CLEANUP authorization rejected; refreshed token and retrying session list once");
+        response = http_client_.Get(list_url, kUserAgent, headers);
+    }
+    AppendSessionTraceLog("CLEANUP list response HTTP " + std::to_string(response.status_code));
+    AppendSessionTraceLog("CLEANUP list response body:\n" + JsonForTrace(response.body));
+
+    bool usable_list = false;
+    bool tracked_session_seen = false;
+    std::string cleanup_error;
+    if (response.status_code >= 200 && response.status_code < 300)
+    {
+        try
+        {
+            JsonPtr root = LoadJson(response.body);
+            json_t* request_status = json_object_get(root.get(), "requestStatus");
+            json_t* sessions = json_object_get(root.get(), "sessions");
+            usable_list =
+                request_status &&
+                GetInteger(request_status, "statusCode") == 1 &&
+                json_is_array(sessions);
+
+            if (usable_list)
+            {
+                size_t index = 0;
+                json_t* cloud_session = nullptr;
+                json_array_foreach(sessions, index, cloud_session)
+                {
+                    const std::string session_id = GetString(cloud_session, "sessionId");
+                    const int status = ParseSessionStatus(
+                        json_object_get(cloud_session, "status"));
+                    const std::string session_device_id = GetString(
+                        json_object_get(cloud_session, "sessionRequestData"),
+                        "deviceHashId");
+                    if (session_id == stale_session_id)
+                        tracked_session_seen = true;
+
+                    if (!cloud_session::ShouldCleanup(
+                            status,
+                            session_id,
+                            session_device_id,
+                            device_id_,
+                            stale_session_id))
+                    {
+                        continue;
+                    }
+
+                    const std::string server_ip = GetSessionServerIp(cloud_session);
+                    AppendSessionTraceLog(
+                        "CLEANUP stopping session id=" + session_id +
+                        " status=" + std::to_string(status) +
+                        " source=" +
+                        (session_id == stale_session_id ? "local_record" : "matching_device") +
+                        " server=" + (server_ip.empty() ? "provider" : server_ip));
+                    try
+                    {
+                        StopSession(session, session_id, server_ip);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        cleanup_error = e.what();
+                        AppendSessionTraceLog(
+                            "CLEANUP stop failed id=" + session_id +
+                            " error=" + cleanup_error);
+                    }
+                }
+            }
+        }
+        catch (const std::exception& e)
+        {
+            AppendSessionTraceLog(
+                "CLEANUP list parse failed error=" + std::string(e.what()));
+        }
+    }
+
+    if (usable_list)
+    {
+        if (!stale_session_id.empty() && !tracked_session_seen)
+            ForgetActiveCloudSession(stale_session_id);
+        if (!cleanup_error.empty())
+            throw std::runtime_error(cleanup_error);
+        return;
+    }
+
+    // Older or temporarily unavailable list endpoints still get the original
+    // local-record cleanup path.
+    if (!stale_session_id.empty())
+    {
+        AppendSessionTraceLog(
+            "CLEANUP session list unavailable; falling back to locally tracked session");
+        StopSession(session, stale_session_id);
+    }
 }
 
 } // namespace opennow
