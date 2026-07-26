@@ -99,10 +99,10 @@ CatalogTab::CatalogTab()
     auto* toolbar = new brls::Box(brls::Axis::ROW);
     toolbar->setAlignItems(brls::AlignItems::CENTER);
     toolbar->setMarginBottom(8);
-    search_button_ = MakeToolbarButton("Y  Search");
-    filter_button_ = MakeToolbarButton("ZL  All stores");
-    sort_button_   = MakeToolbarButton("ZR  A-Z");
-    more_button_   = MakeToolbarButton("X  More / Refresh");
+    search_button_ = MakeToolbarButton("Y  " + Tr("Search"));
+    filter_button_ = MakeToolbarButton("ZL  " + Tr("All stores"));
+    sort_button_   = MakeToolbarButton("ZR  " + Tr("A-Z"));
+    more_button_   = MakeToolbarButton("X  " + Tr("More / Refresh"));
     search_button_->setStyle(&brls::BUTTONSTYLE_HIGHLIGHT);
     toolbar_buttons_ = {search_button_, filter_button_, sort_button_, more_button_};
     for (brls::View* button : toolbar_buttons_)
@@ -319,18 +319,23 @@ void CatalogTab::RebuildList()
         page_index_ = total_pages - 1;
     const size_t page_start = std::min(filtered_count_, page_index_ * kInitialVisibleGameLimit);
     const size_t page_end = std::min(filtered_count_, page_start + kInitialVisibleGameLimit);
-    std::string status = "Loaded " + std::to_string(games_.size()) + " supported games.";
-    status += " Filter: " + std::string(kStoreFilters[store_filter_index_]) + ".";
-    status += " Sort: " + std::string(kCatalogSortModes[sort_mode_index_]) + ".";
+    std::string status = TrFormat(
+        "Loaded {0} supported games.", {std::to_string(games_.size())});
+    status += " " + TrFormat(
+        "Filter: {0}.", {Tr(kStoreFilters[store_filter_index_])});
+    status += " " + TrFormat(
+        "Sort: {0}.", {Tr(kCatalogSortModes[sort_mode_index_])});
     if (!search_query_.empty())
-        status += " Found " + std::to_string(filtered_count_) + " matches.";
+        status += " " + TrFormat(
+            "Found {0} matches.", {std::to_string(filtered_count_)});
     if (filtered_count_ > 0)
-        status += " Showing " + std::to_string(page_start + 1) + "-" +
-            std::to_string(page_end) + " of " + std::to_string(filtered_count_) +
-            " (page " + std::to_string(page_index_ + 1) + "/" +
-            std::to_string(total_pages) + ").";
+        status += " " + TrFormat(
+            "Showing {0}-{1} of {2} (page {3}/{4}).",
+            {std::to_string(page_start + 1), std::to_string(page_end),
+             std::to_string(filtered_count_), std::to_string(page_index_ + 1),
+             std::to_string(total_pages)});
     else
-        status += " Press X to refresh.";
+        status += " " + Tr("Press X to refresh.");
 
     status_label_->setText(status);
     filter_button_->setText("ZL  " + Tr(kStoreFilters[store_filter_index_]));
@@ -443,8 +448,8 @@ void CatalogTab::AttachPagingButton(bool has_more, size_t remaining)
 
     previous_page_button_->setText(Tr(page_index_ > 0 ? "Previous page" : "First page"));
     load_more_button_->setText(has_more
-        ? "Show more games (" + std::to_string(remaining) + " left)"
-        : "Refresh catalog");
+        ? TrFormat("Show more games ({0} left)", {std::to_string(remaining)})
+        : Tr("Refresh catalog"));
     list_container_->addView(paging_container_);
     paging_button_attached_ = true;
 }

@@ -6,6 +6,7 @@
 #include "game_grid_navigation.hpp"
 #include "library_sort.hpp"
 #include "membership_label.hpp"
+#include "providers_tab.hpp"
 #include "ui_action_guard.hpp"
 #include "ui_helpers.hpp"
 #include "qr_login_dialog.hpp"
@@ -161,10 +162,10 @@ LibraryTab::LibraryTab()
     auto* toolbar = new brls::Box(brls::Axis::ROW);
     toolbar->setAlignItems(brls::AlignItems::CENTER);
     toolbar->setMarginBottom(8);
-    search_button_ = MakeToolbarButton("Y  Search");
-    filter_button_ = MakeToolbarButton("ZL  All stores");
-    sort_button_   = MakeToolbarButton("ZR  Last Played");
-    more_button_   = MakeToolbarButton("X  More / Refresh");
+    search_button_ = MakeToolbarButton("Y  " + Tr("Search"));
+    filter_button_ = MakeToolbarButton("ZL  " + Tr("All stores"));
+    sort_button_   = MakeToolbarButton("ZR  " + Tr("Last Played"));
+    more_button_   = MakeToolbarButton("X  " + Tr("More / Refresh"));
     search_button_->setStyle(&brls::BUTTONSTYLE_HIGHLIGHT);
     toolbar_buttons_ = {search_button_, filter_button_, sort_button_, more_button_};
     for (brls::View* button : toolbar_buttons_)
@@ -286,8 +287,8 @@ void LibraryTab::UpdateSessionUi()
     const auto& state = AppState::Instance();
     if (!state.HasSession())
     {
-        account_label_->setText("No GeForce NOW account connected on this Switch yet.");
-        status_label_->setText("Sign in to load your GeForce NOW library.");
+        account_label_->setText(Tr("No GeForce NOW account connected on this Switch yet."));
+        status_label_->setText(Tr("Sign in to load your GeForce NOW library."));
         sign_in_button_->setText(Tr("Sign in to GeForce NOW"));
         refresh_button_->setState(brls::ButtonState::DISABLED);
         logout_button_->setState(brls::ButtonState::DISABLED);
@@ -300,15 +301,17 @@ void LibraryTab::UpdateSessionUi()
 
     if (session.reauthentication_required)
     {
-        account_label_->setText("Reconnect required for " + session.user.display_name);
-        status_label_->setText("NVIDIA revoked or expired the saved refresh token.");
+        account_label_->setText(TrFormat(
+            "Reconnect required for {0}", {session.user.display_name}));
+        status_label_->setText(Tr("NVIDIA revoked or expired the saved refresh token."));
         sign_in_button_->setText(Tr("Reconnect this account"));
         refresh_button_->setState(brls::ButtonState::DISABLED);
     }
     else
     {
-        account_label_->setText(
-            "Connected as " + session.user.display_name + "  |  " + membership + " tier");
+        account_label_->setText(TrFormat(
+            "Connected as {0}  |  {1} tier",
+            {session.user.display_name, membership}));
         sign_in_button_->setText(Tr("Add another account"));
         refresh_button_->setState(brls::ButtonState::ENABLED);
     }
@@ -320,26 +323,25 @@ void LibraryTab::BeginLogin()
     try
     {
         auto& state = AppState::Instance();
-        std::vector<LoginProvider> providers =
-            state.HasProviders() ? state.providers() : client_.FetchLoginProviders();
-
-        if (!state.HasProviders())
-            state.SetProviders(providers);
-
-        if (providers.empty())
-            throw std::runtime_error("No GeForce NOW login providers were returned");
-
-        const LoginProvider provider = state.HasSession() && state.session()->reauthentication_required
-            ? state.session()->provider
-            : providers.front();
         const auto alive = alive_;
-        auto* dialog = new QrLoginDialog(provider, client_, [this, alive]() {
+
+        auto on_success = [this, alive]() {
             if (!alive->load())
                 return;
             UpdateSessionUi();
             ReloadLibrary();
-        });
-        brls::Application::pushActivity(new brls::Activity(dialog));
+        };
+
+        if (state.HasSession() && state.session()->reauthentication_required)
+        {
+            auto* dialog = new QrLoginDialog(
+                state.session()->provider, client_, std::move(on_success));
+            brls::Application::pushActivity(new brls::Activity(dialog));
+            return;
+        }
+
+        auto* providers = new ProvidersTab(std::move(on_success));
+        brls::Application::pushActivity(new brls::Activity(providers));
     }
     catch (const std::exception& ex)
     {
@@ -389,7 +391,7 @@ void LibraryTab::ReloadLibrary(bool background)
     // Throttle automatic retries even when NVIDIA temporarily rejects a
     // refresh, otherwise every tab appearance immediately repeats it.
     last_library_sync_ = std::chrono::steady_clock::now();
-    status_label_->setText("Syncing your GeForce NOW library...");
+    status_label_->setText(Tr("Syncing your GeForce NOW library..."));
 
     AuthSession session = *state.session();
     GfnClient client = client_;
@@ -428,8 +430,8 @@ void LibraryTab::ReloadLibrary(bool background)
                 loading_ = false;
                 if (background && !games_.empty())
                 {
-                    status_label_->setText(
-                        "Showing cached library. NVIDIA background refresh is temporarily unavailable.");
+                    status_label_->setText(Tr(
+                        "Showing cached library. NVIDIA background refresh is temporarily unavailable."));
                     return;
                 }
                 ShowError("Library Sync Failed", error);
@@ -497,15 +499,21 @@ void LibraryTab::LoadMore()
         load_more_button_ = nullptr;
     }
     
-    std::string status = "Loaded " + std::to_string(games_.size()) + " games.";
-    status += " Filter: " + std::string(kStoreFilters[store_filter_index_]) + ".";
-    status += " Sort: " + std::string(kLibrarySortModes[sort_mode_index_]) + ".";
+    std::string status = TrFormat(
+        "Loaded {0} games.", {std::to_string(games_.size())});
+    status += " " + TrFormat(
+        "Filter: {0}.", {Tr(kStoreFilters[store_filter_index_])});
+    status += " " + TrFormat(
+        "Sort: {0}.", {Tr(kLibrarySortModes[sort_mode_index_])});
     if (!search_query_.empty())
-        status += " Found " + std::to_string(filtered_count_) + " matches.";
+        status += " " + TrFormat(
+            "Found {0} matches.", {std::to_string(filtered_count_)});
     if (filtered_count_ > visible_count)
-        status += " Showing first " + std::to_string(visible_count) + ". Press X or select Show more.";
+        status += " " + TrFormat(
+            "Showing first {0}. Press X or select Show more.",
+            {std::to_string(visible_count)});
     else
-        status += " Press X to refresh.";
+        status += " " + Tr("Press X to refresh.");
     
     status_label_->setText(status);
     filter_button_->setText("ZL  " + Tr(kStoreFilters[store_filter_index_]));
@@ -572,8 +580,9 @@ void LibraryTab::LoadMore()
     if (filtered_count_ > visible_count)
     {
         load_more_button_ = new brls::Button();
-        load_more_button_->setText(
-            "Show more games (" + std::to_string(filtered_count_ - visible_count) + " left)");
+        load_more_button_->setText(TrFormat(
+            "Show more games ({0} left)",
+            {std::to_string(filtered_count_ - visible_count)}));
         load_more_button_->setStyle(&brls::BUTTONSTYLE_PRIMARY);
         load_more_button_->setMarginTop(14);
         load_more_button_->setMarginBottom(24);

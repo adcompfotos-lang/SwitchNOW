@@ -89,9 +89,22 @@ ExternalProject_Add(mbedtls
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
 )
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls/include/mbedtls/mbedtls_config.h INPUT_CONTENT)
-string(REPLACE "//#define MBEDTLS_SSL_DTLS_SRTP" "#define MBEDTLS_SSL_DTLS_SRTP" MODIFIED_CONTENT ${INPUT_CONTENT})
-file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls/include/mbedtls/mbedtls_config.h "${MODIFIED_CONTENT}\n#define MBEDTLS_NO_PLATFORM_ENTROPY\n#define MBEDTLS_TEST_NULL_ENTROPY\n#undef MBEDTLS_TIMING_C\n#undef MBEDTLS_NET_C\n")
+# Apply Switch overrides once. Re-appending them on every configure grows the
+# source file indefinitely and eventually makes repeated builds unreliable.
+set(_SWITCHNOW_MBEDTLS_CONFIG
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls/include/mbedtls/mbedtls_config.h")
+set(_SWITCHNOW_MBEDTLS_MARKER "/* SwitchNOW mbedTLS overrides */")
+file(READ "${_SWITCHNOW_MBEDTLS_CONFIG}" INPUT_CONTENT)
+if(NOT INPUT_CONTENT MATCHES "Switch mbed[Tt][Ll][Ss] overrides")
+  string(REPLACE
+    "//#define MBEDTLS_SSL_DTLS_SRTP"
+    "#define MBEDTLS_SSL_DTLS_SRTP"
+    MODIFIED_CONTENT
+    "${INPUT_CONTENT}")
+  file(WRITE
+    "${_SWITCHNOW_MBEDTLS_CONFIG}"
+    "${MODIFIED_CONTENT}\n${_SWITCHNOW_MBEDTLS_MARKER}\n#define MBEDTLS_NO_PLATFORM_ENTROPY\n#define MBEDTLS_TEST_NULL_ENTROPY\n#undef MBEDTLS_TIMING_C\n#undef MBEDTLS_NET_C\n")
+endif()
 
 ExternalProject_Add(srtp2
   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libsrtp

@@ -1,8 +1,14 @@
 #include "http_client.hpp"
 
+#include "runtime_journal.hpp"
+
 #include <curl/curl.h>
 
+#include <array>
+#include <chrono>
+#include <cmath>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -19,6 +25,23 @@ size_t WriteBody(char* ptr, size_t size, size_t nmemb, void* userdata)
     return bytes;
 }
 
+bool IsArtworkRequest(const std::string& url)
+{
+    return url.find("img.nvidiagrid.net") != std::string::npos ||
+           url.find("steamstatic.com") != std::string::npos ||
+           url.find("akamaihd.net") != std::string::npos;
+}
+
+bool IsSessionPollRequest(
+    const std::string& method, const std::string& url)
+{
+    if (method != "GET")
+        return false;
+    const auto marker = url.find("/v2/session/");
+    return marker != std::string::npos &&
+           marker + std::string("/v2/session/").size() < url.size();
+}
+
 } // namespace
 
 HttpResponse HttpClient::Request(
@@ -26,14 +49,30 @@ HttpResponse HttpClient::Request(
     const std::string& url,
     const std::string& user_agent,
     const std::vector<std::string>& headers,
-    const std::string& body) const
+    const std::string& body,
+    long connect_timeout_seconds,
+    long timeout_seconds) const
 {
+    const bool artwork_request = IsArtworkRequest(url);
+    const bool session_poll_request = IsSessionPollRequest(method, url);
+    const bool journal_request = !artwork_request && !session_poll_request;
+    const auto started_at = std::chrono::steady_clock::now();
+    const std::string safe_url = SanitizeRuntimeUrl(url);
+    const std::uint64_t operation_id = journal_request
+        ? BeginRuntimeOperation("http", method, "url=" + safe_url)
+        : 0;
+
     CURL* raw = curl_easy_init();
     if (!raw)
+    {
+        if (journal_request)
+            EndRuntimeOperation(operation_id, "http", method, "error", "curl_easy_init_failed");
         throw std::runtime_error("curl_easy_init failed");
+    }
 
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(raw, &curl_easy_cleanup);
     std::string response_body;
+    std::array<char, CURL_ERROR_SIZE> error_buffer {};
 
     curl_slist* raw_headers = nullptr;
     for (const auto& header : headers)
@@ -46,13 +85,14 @@ HttpResponse HttpClient::Request(
     curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, user_agent.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, connect_timeout_seconds);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, timeout_seconds);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, WriteBody);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response_body);
     curl_easy_setopt(curl.get(), CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, error_buffer.data());
 
     if (header_list)
         curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
@@ -74,14 +114,47 @@ HttpResponse HttpClient::Request(
     }
 
     const CURLcode result = curl_easy_perform(curl.get());
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started_at).count();
     if (result != CURLE_OK)
     {
+        long verify_result = 0;
+        char* primary_ip = nullptr;
+        curl_easy_getinfo(curl.get(), CURLINFO_SSL_VERIFYRESULT, &verify_result);
+        curl_easy_getinfo(curl.get(), CURLINFO_PRIMARY_IP, &primary_ip);
+        std::ostringstream detail;
+        detail << "url=" << safe_url
+               << " curl_code=" << static_cast<int>(result)
+               << " curl_error=" << curl_easy_strerror(result)
+               << " ssl_verify=" << verify_result
+               << " elapsed_ms=" << elapsed_ms;
+        if (error_buffer[0] != '\0')
+            detail << " backend_error=" << error_buffer.data();
+        if (primary_ip && *primary_ip)
+            detail << " primary_ip=" << primary_ip;
+
+        if (journal_request)
+            EndRuntimeOperation(operation_id, "http", method, "error", detail.str());
+        else if (artwork_request)
+            LogRuntimeEvent("http", "artwork_error", detail.str());
+        else
+            LogRuntimeEvent("http", "session_poll_error", detail.str());
         throw std::runtime_error(
-            "HTTP " + method + " failed for " + url + ": " + curl_easy_strerror(result));
+            "HTTP " + method + " failed for " + safe_url + ": " +
+            curl_easy_strerror(result));
     }
 
     long status_code = 0;
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status_code);
+    if (journal_request)
+    {
+        EndRuntimeOperation(
+            operation_id, "http", method, "ok",
+            "url=" + safe_url +
+            " status=" + std::to_string(status_code) +
+            " bytes=" + std::to_string(response_body.size()) +
+            " elapsed_ms=" + std::to_string(elapsed_ms));
+    }
 
     return HttpResponse{
         .status_code = status_code,
@@ -92,9 +165,13 @@ HttpResponse HttpClient::Request(
 HttpResponse HttpClient::Get(
     const std::string& url,
     const std::string& user_agent,
-    const std::vector<std::string>& headers) const
+    const std::vector<std::string>& headers,
+    long connect_timeout_seconds,
+    long timeout_seconds) const
 {
-    return Request("GET", url, user_agent, headers);
+    return Request(
+        "GET", url, user_agent, headers, {},
+        connect_timeout_seconds, timeout_seconds);
 }
 
 HttpResponse HttpClient::Post(
@@ -104,6 +181,35 @@ HttpResponse HttpClient::Post(
     const std::string& body) const
 {
     return Request("POST", url, user_agent, headers, body);
+}
+
+int HttpClient::MeasureConnectLatencyMs(
+    const std::string& url,
+    long timeout_ms) const noexcept
+{
+    CURL* raw = curl_easy_init();
+    if (!raw)
+        return -1;
+
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(raw, &curl_easy_cleanup);
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECT_ONLY, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_FRESH_CONNECT, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+
+    if (curl_easy_perform(curl.get()) != CURLE_OK)
+        return -1;
+
+    double connect_seconds = 0.0;
+    if (curl_easy_getinfo(curl.get(), CURLINFO_CONNECT_TIME, &connect_seconds) != CURLE_OK ||
+        connect_seconds < 0.0)
+        return -1;
+
+    return static_cast<int>(std::lround(connect_seconds * 1000.0));
 }
 
 } // namespace opennow

@@ -145,8 +145,16 @@ void SetLaunchProgress(
         animation->SetState(stage, progress);
     if (stage_label)
     {
-        stage_label->setText(Tr(title));
         const bool queue_position = title.rfind("Position in queue:", 0) == 0;
+        if (queue_position)
+        {
+            const std::string value = title.substr(std::string("Position in queue:").size());
+            stage_label->setText(TrFormat("Position in queue:{0}", {value}));
+        }
+        else
+        {
+            stage_label->setText(Tr(title));
+        }
         stage_label->setFontSize(queue_position ? 36 : 27);
         stage_label->setTextColor(queue_position
             ? nvgRGB(98, 232, 148)
@@ -155,7 +163,8 @@ void SetLaunchProgress(
     if (detail_label)
     {
         detail_label->setText(Tr(detail));
-        detail_label->setFontSize(title.rfind("Position in queue:", 0) == 0 ? 18 : 16);
+        detail_label->setFontSize(
+            title.rfind("Position in queue:", 0) == 0 ? 18 : 16);
     }
 }
 
@@ -225,7 +234,7 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
     cover->setCornerRadius(12);
     cover->setScalingType(brls::ImageScalingType::FILL);
     cover->setMarginRight(20);
-    SetCachedCoverImage(cover, image_url);
+    SetCachedThumbnailImage(cover, image_url);
     game_header->addView(cover);
 
     auto* game_copy = new brls::Box(brls::Axis::COLUMN);

@@ -94,7 +94,7 @@ void GameCardView::UpdateChrome(bool focused)
 
 void GameCardView::LoadImage()
 {
-    SetCachedCoverImage(image_, display_.image_url);
+    SetCachedThumbnailImage(image_, display_.image_url);
 }
 
 } // namespace opennow

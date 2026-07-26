@@ -110,6 +110,7 @@ The default **Xbox** layout maps the physical Switch positions to Xbox labels:
 | --- | --- |
 | `- + Y` | Open the transparent in-stream keyboard |
 | `A` | Select a key / confirm inside the keyboard |
+| `ZL` | Send `Esc` to the remote game while the keyboard is open |
 | `+` | Submit the entered text and close the keyboard |
 | `B` | Close the keyboard without submitting |
 | Touch | Reposition the remote cursor to the touched point and perform a left click |
@@ -174,7 +175,7 @@ build/switch/SwitchNOW.nro
 Create a conventional release archive:
 
 ```powershell
-.\scripts\package-release.ps1 -Version 1.0.1
+.\scripts\package-release.ps1 -Version 1.1.0
 ```
 
 ## Source layout

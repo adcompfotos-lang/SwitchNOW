@@ -4,6 +4,7 @@
 #include "gfn_client.hpp"
 #include "main_tabs_view.hpp"
 #include "localization.hpp"
+#include "runtime_journal.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -82,11 +83,13 @@ class StartupGateView final : public brls::Box
         AuthSession saved;
         if (!client.LoadSavedSession(saved))
         {
+            LogRuntimeEvent("auth", "startup_no_saved_session");
             AppState::Instance().MarkSessionLoaded();
             ShowMainTabs();
             return;
         }
 
+        LogRuntimeEvent("auth", "startup_saved_session_found");
         BuildStatusView(saved);
         BeginAuthentication(std::move(client), std::move(saved));
     }
@@ -177,7 +180,10 @@ class StartupGateView final : public brls::Box
     void BeginAuthentication(GfnClient client, AuthSession saved)
     {
         const auto alive = alive_;
-        brls::async([this, alive, client = std::move(client), saved = std::move(saved)]() mutable {
+        const std::uint64_t operation_id =
+            BeginRuntimeOperation("auth", "startup_session_recovery");
+        brls::async([this, alive, operation_id, client = std::move(client),
+                     saved = std::move(saved)]() mutable {
             try
             {
                 SetStatus("Checking NVIDIA session",
@@ -191,16 +197,31 @@ class StartupGateView final : public brls::Box
                     [alive]() { return !alive->load(); });
 
                 if (!alive->load())
+                {
+                    EndRuntimeOperation(
+                        operation_id, "auth", "startup_session_recovery",
+                        "cancelled");
                     return;
+                }
                 SetStatus("Account verified", "Loading SwitchNOW and your saved profile.");
                 verified.reauthentication_required = false;
+                EndRuntimeOperation(
+                    operation_id, "auth", "startup_session_recovery", "ok");
                 Complete(std::move(verified), "NVIDIA account is ready");
             }
             catch (const ReauthenticationRequired& ex)
             {
                 if (!alive->load())
+                {
+                    EndRuntimeOperation(
+                        operation_id, "auth", "startup_session_recovery",
+                        "cancelled");
                     return;
+                }
                 saved.reauthentication_required = true;
+                EndRuntimeOperation(
+                    operation_id, "auth", "startup_session_recovery",
+                    "reauthentication_required", ex.what());
                 Complete(std::move(saved),
                          "Automatic sign-in needs the saved password or account confirmation");
                 brls::Logger::warning("Startup automatic sign-in requires interaction: {}", ex.what());
@@ -208,12 +229,20 @@ class StartupGateView final : public brls::Box
             catch (const std::exception& ex)
             {
                 if (!alive->load())
+                {
+                    EndRuntimeOperation(
+                        operation_id, "auth", "startup_session_recovery",
+                        "cancelled");
                     return;
+                }
                 const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 const bool expired = saved.tokens.expires_at_ms > 0 &&
                     saved.tokens.expires_at_ms <= now_ms;
                 saved.reauthentication_required = saved.reauthentication_required || expired;
+                EndRuntimeOperation(
+                    operation_id, "auth", "startup_session_recovery",
+                    expired ? "expired" : "temporary_error", ex.what());
                 Complete(std::move(saved),
                          expired
                             ? "Automatic sign-in could not finish; it will retry in SwitchNOW"

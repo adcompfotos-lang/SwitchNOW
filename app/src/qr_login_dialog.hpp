@@ -38,17 +38,17 @@ private:
 
     LoginProvider provider_;
     const GfnClient& client_;
-    brls::Label* status_label_;
-    brls::Label* instruction_label_;
-    brls::Label* url_label_;
-    brls::Button* remember_button_;
-    brls::Button* remember_password_button_;
-    brls::Button* device_login_button_;
-    brls::Button* different_account_button_;
-    brls::Button* cancel_login_button_;
+    brls::Label* status_label_ = nullptr;
+    brls::Label* instruction_label_ = nullptr;
+    brls::Label* url_label_ = nullptr;
+    brls::Button* remember_button_ = nullptr;
+    brls::Button* remember_password_button_ = nullptr;
+    brls::Button* device_login_button_ = nullptr;
+    brls::Button* different_account_button_ = nullptr;
+    brls::Button* cancel_login_button_ = nullptr;
     brls::Dialog* email_waiting_dialog_ = nullptr;
     brls::Label* email_waiting_label_ = nullptr;
-    brls::Button* qr_login_button_;
+    brls::Button* qr_login_button_ = nullptr;
 
     std::atomic<bool> is_cancelled_{false};
     std::atomic<bool> login_active_{false};

@@ -2,6 +2,7 @@
 #include "cloud_session_policy.hpp"
 #include "device_identity.hpp"
 #include "play_history.hpp"
+#include "server_location_policy.hpp"
 
 #ifdef __SWITCH__
 #include <arpa/inet.h>
@@ -21,6 +22,7 @@
 #include "network_utils.hpp"
 #include "auth_policy.hpp"
 #include "native_auth_policy.hpp"
+#include "runtime_journal.hpp"
 #include "stream_settings.hpp"
 #include "stream_diagnostics.hpp"
 #include <algorithm>
@@ -75,6 +77,7 @@ constexpr int kLoginCallbackPort         = 2259;
 
 constexpr const char* kPanelsQueryHash          = "f8e26265a5db5c20e1334a6872cf04b6e3970507697f6ae55a6ddefa5420daf0";
 constexpr const char* kLibraryWithTimeQueryHash = "039e8c0d553972975485fee56e59f2549d2fdb518e247a42ab5022056a74406f";
+constexpr const char* kAppMetadataQueryHash     = "39187e85b6dcf60b7279a5f233288b0a8b69a8b1dbcfb5b25555afdcb988f0d7";
 
 constexpr const char* kNvidiaFileOrigin  = "https://nvfile";
 constexpr const char* kNvidiaFileReferer = "https://nvfile/";
@@ -84,6 +87,18 @@ constexpr const char* kPlayReferer       = "https://play.geforcenow.com/";
 constexpr std::int64_t kRefreshWindowMs = 10LL * 60LL * 1000LL;
 std::recursive_mutex g_accounts_mutex;
 std::mutex g_reauthentication_mutex;
+
+struct RegionSelectionCache
+{
+    std::mutex mutex;
+    std::string provider_url;
+    std::string selected_url;
+    std::chrono::steady_clock::time_point measured_at {};
+};
+
+RegionSelectionCache g_region_selection_cache;
+constexpr auto kRegionSelectionCacheLifetime = std::chrono::minutes(15);
+
 std::string Trim(const std::string& value)
 {
     size_t begin = 0;
@@ -1169,6 +1184,31 @@ std::vector<std::string> BuildGfnLcarsHeaders(
     return headers;
 }
 
+int MeasureAverageLatency(const HttpClient& http_client, const std::string& url)
+{
+    // Ignore the first connect so DNS and TLS setup do not bias the selected region.
+    (void)http_client.MeasureConnectLatencyMs(url);
+
+    int total_ms = 0;
+    int successful = 0;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        if (attempt > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        const int ping_ms = http_client.MeasureConnectLatencyMs(url);
+        if (ping_ms >= 0)
+        {
+            total_ms += ping_ms;
+            ++successful;
+        }
+    }
+
+    return successful == 0
+        ? -1
+        : static_cast<int>((total_ms + successful / 2) / successful);
+}
+
 std::vector<std::string> BuildGraphQlHeaders(const std::string& token)
 {
     std::vector<std::string> headers;
@@ -1892,10 +1932,24 @@ std::string ResolveSessionJwt(const AuthSession& session)
     return session.tokens.id_token.empty() ? session.tokens.access_token : session.tokens.id_token;
 }
 
-std::string OptimizeImageUrl(const std::string& url)
+std::string OptimizeImageUrl(const std::string& url, int width = 544)
 {
     if (url.find("img.nvidiagrid.net") != std::string::npos)
-        return url + ";w=272";
+    {
+        std::string optimized = url;
+        const auto width_marker = optimized.find(";w=");
+        if (width_marker != std::string::npos)
+        {
+            auto width_end = width_marker + 3;
+            while (width_end < optimized.size() &&
+                   std::isdigit(static_cast<unsigned char>(optimized[width_end])))
+            {
+                ++width_end;
+            }
+            optimized.erase(width_marker, width_end - width_marker);
+        }
+        return optimized + ";w=" + std::to_string(width);
+    }
 
     return url;
 }
@@ -1915,18 +1969,92 @@ bool IsNumericId(const std::string& value)
     });
 }
 
+void AppendUnique(std::vector<std::string>& values, std::string value)
+{
+    value = Trim(value);
+    if (value.empty() ||
+        std::find(values.begin(), values.end(), value) != values.end())
+    {
+        return;
+    }
+    values.push_back(std::move(value));
+}
+
+std::vector<std::string> ParseLabelArray(json_t* value)
+{
+    std::vector<std::string> labels;
+    if (!json_is_array(value))
+        return labels;
+
+    size_t index = 0;
+    json_t* entry = nullptr;
+    json_array_foreach(value, index, entry)
+    {
+        if (json_is_string(entry) || json_is_integer(entry))
+        {
+            AppendUnique(labels, JsonString(entry));
+            continue;
+        }
+        if (!json_is_object(entry))
+            continue;
+
+        for (const char* key :
+             {"label", "name", "title", "displayName", "rating", "value"})
+        {
+            const std::string label = GetString(entry, key);
+            if (!label.empty())
+            {
+                AppendUnique(labels, label);
+                break;
+            }
+        }
+    }
+    return labels;
+}
+
+std::vector<std::string> ParseImageArray(json_t* images, const char* key, int width)
+{
+    std::vector<std::string> urls;
+    if (!json_is_object(images))
+        return urls;
+
+    json_t* value = json_object_get(images, key);
+    if (json_is_string(value))
+    {
+        AppendUnique(urls, OptimizeImageUrl(JsonString(value), width));
+        return urls;
+    }
+    if (!json_is_array(value))
+        return urls;
+
+    size_t index = 0;
+    json_t* entry = nullptr;
+    json_array_foreach(value, index, entry)
+    {
+        if (json_is_string(entry))
+            AppendUnique(urls, OptimizeImageUrl(JsonString(entry), width));
+    }
+    return urls;
+}
+
 GameInfo ParseApp(json_t* app)
 {
     GameInfo game;
     game.id                 = GetString(app, "id");
     game.uuid               = game.id;
     game.title              = GetString(app, "title");
-    game.description        = GetString(app, "description");
-    if (game.description.empty())
-        game.description = GetString(app, "longDescription");
+    game.description        = GetString(app, "longDescription");
     if (game.description.empty())
         game.description = GetString(app, "shortDescription");
+    if (game.description.empty())
+        game.description = GetString(app, "description");
     game.publisher          = GetString(app, "publisherName");
+    game.developer          = GetString(app, "developerName");
+    game.genres             = ParseLabelArray(json_object_get(app, "genres"));
+    game.feature_labels     = ParseLabelArray(json_object_get(app, "featureLabels"));
+    if (game.feature_labels.empty())
+        game.feature_labels = ParseLabelArray(json_object_get(app, "features"));
+    game.content_ratings    = ParseLabelArray(json_object_get(app, "contentRatings"));
     json_t* app_gfn = json_object_get(app, "gfn");
     game.membership_tier_label = GetString(app_gfn, "minimumMembershipTierLabel");
     json_t* app_library = app_gfn ? json_object_get(app_gfn, "library") : nullptr;
@@ -1935,15 +2063,38 @@ GameInfo ParseApp(json_t* app)
         game.last_played = GetString(app_library, "lastPlayedAt");
 
     json_t* images = json_object_get(app, "images");
-    for (const char* key : {"KEY_ART", "GAME_BOX_ART", "TV_BANNER", "HERO_IMAGE"})
+    const std::string key_art = GetString(images, "KEY_ART");
+    const std::string box_art = GetString(images, "GAME_BOX_ART");
+    const std::string tv_banner = GetString(images, "TV_BANNER");
+    const std::string hero_image = GetString(images, "HERO_IMAGE");
+
+    for (const std::string& candidate : {tv_banner, key_art, hero_image, box_art})
     {
-        const std::string candidate = GetString(images, key);
         if (!candidate.empty())
         {
-            game.image_url = OptimizeImageUrl(candidate);
+            game.image_url = OptimizeImageUrl(candidate, 544);
             break;
         }
     }
+    for (const std::string& candidate : {box_art, key_art, tv_banner, hero_image})
+    {
+        if (!candidate.empty())
+        {
+            game.poster_url = OptimizeImageUrl(candidate, 720);
+            break;
+        }
+    }
+    for (const std::string& candidate : {hero_image, tv_banner, key_art})
+    {
+        if (!candidate.empty())
+        {
+            game.hero_url = OptimizeImageUrl(candidate, 1280);
+            break;
+        }
+    }
+    game.screenshots = ParseImageArray(images, "SCREENSHOTS", 1280);
+    if (game.screenshots.empty())
+        game.screenshots = ParseImageArray(images, "SCREENSHOT_THUMB", 1280);
 
     json_t* variants = json_object_get(app, "variants");
     if (json_is_array(variants))
@@ -1955,6 +2106,11 @@ GameInfo ParseApp(json_t* app)
             GameVariant variant;
             variant.id    = GetString(entry, "id");
             variant.store = GetString(entry, "appStore");
+            for (const std::string& control :
+                 ParseLabelArray(json_object_get(entry, "supportedControls")))
+            {
+                AppendUnique(game.supported_controls, control);
+            }
 
             json_t* gfn = json_object_get(entry, "gfn");
             variant.gfn_status = GetString(gfn, "status");
@@ -2010,6 +2166,33 @@ void MergeGame(GameInfo& target, const GameInfo& incoming)
 
     if (target.publisher.empty())
         target.publisher = incoming.publisher;
+
+    if (target.developer.empty())
+        target.developer = incoming.developer;
+
+    if (target.poster_url.empty())
+        target.poster_url = incoming.poster_url;
+
+    if (target.hero_url.empty())
+        target.hero_url = incoming.hero_url;
+
+    for (const auto& screenshot : incoming.screenshots)
+    {
+        if (std::find(target.screenshots.begin(), target.screenshots.end(), screenshot) ==
+            target.screenshots.end())
+        {
+            target.screenshots.push_back(screenshot);
+        }
+    }
+
+    for (const auto& genre : incoming.genres)
+        AppendUnique(target.genres, genre);
+    for (const auto& feature : incoming.feature_labels)
+        AppendUnique(target.feature_labels, feature);
+    for (const auto& rating : incoming.content_ratings)
+        AppendUnique(target.content_ratings, rating);
+    for (const auto& control : incoming.supported_controls)
+        AppendUnique(target.supported_controls, control);
 
     if (!incoming.last_played.empty() &&
         (target.last_played.empty() || incoming.last_played > target.last_played))
@@ -2074,6 +2257,33 @@ std::string BuildLibraryUrl(const std::string& vpc_id, bool with_library_time)
     url += "&extensions=" + UrlEncode(extensions);
     url += "&huId=" + UrlEncode(HexEncode(GenerateRandomBytes(8).data(), 8));
     url += "&variables=" + UrlEncode(variables);
+    return url;
+}
+
+std::string BuildAppMetadataUrl(
+    const std::string& vpc_id, const std::vector<std::string>& app_ids)
+{
+    JsonPtr variables(json_object(), &json_decref);
+    JsonPtr ids(json_array(), &json_decref);
+    json_object_set_new(variables.get(), "vpcId", json_string(vpc_id.c_str()));
+    json_object_set_new(variables.get(), "locale", json_string(kDefaultLocale));
+    for (const std::string& id : app_ids)
+        json_array_append_new(ids.get(), json_string(id.c_str()));
+    json_object_set_new(variables.get(), "appIds", json_incref(ids.get()));
+
+    JsonPtr extensions(json_object(), &json_decref);
+    JsonPtr persisted(json_object(), &json_decref);
+    json_object_set_new(
+        persisted.get(), "sha256Hash", json_string(kAppMetadataQueryHash));
+    json_object_set_new(
+        extensions.get(), "persistedQuery", json_incref(persisted.get()));
+
+    std::string url = std::string(kGraphQlEndpoint) + "?";
+    url += "requestType=" + UrlEncode("appMetaData");
+    url += "&extensions=" + UrlEncode(DumpJson(extensions.get()));
+    const std::vector<unsigned char> random = GenerateRandomBytes(8);
+    url += "&huId=" + UrlEncode(HexEncode(random.data(), random.size()));
+    url += "&variables=" + UrlEncode(DumpJson(variables.get()));
     return url;
 }
 
@@ -2153,6 +2363,73 @@ std::vector<GameInfo> ParseLibraryGames(JsonPtr& root)
     return games;
 }
 
+void EnrichGamesWithMetadata(
+    const HttpClient& http_client,
+    const std::string& jwt_token,
+    const std::string& vpc_id,
+    std::vector<GameInfo>& games)
+{
+    std::vector<std::string> app_ids;
+    app_ids.reserve(games.size());
+    for (const GameInfo& game : games)
+    {
+        const std::string& id = game.uuid.empty() ? game.id : game.uuid;
+        if (!id.empty() &&
+            std::find(app_ids.begin(), app_ids.end(), id) == app_ids.end())
+        {
+            app_ids.push_back(id);
+        }
+    }
+    if (app_ids.empty())
+        return;
+
+    std::unordered_map<std::string, size_t> game_by_id;
+    for (size_t index = 0; index < games.size(); ++index)
+    {
+        game_by_id[games[index].id] = index;
+        if (!games[index].uuid.empty())
+            game_by_id[games[index].uuid] = index;
+    }
+
+    constexpr size_t kChunkSize = 40;
+    for (size_t offset = 0; offset < app_ids.size(); offset += kChunkSize)
+    {
+        const size_t end = std::min(offset + kChunkSize, app_ids.size());
+        const std::vector<std::string> chunk(
+            app_ids.begin() + static_cast<std::ptrdiff_t>(offset),
+            app_ids.begin() + static_cast<std::ptrdiff_t>(end));
+
+        const HttpResponse response = http_client.Get(
+            BuildAppMetadataUrl(vpc_id, chunk),
+            GfnClient::kUserAgent,
+            BuildGraphQlHeaders(jwt_token));
+        if (response.status_code != 200)
+        {
+            throw std::runtime_error(
+                "App metadata fetch failed with HTTP " +
+                std::to_string(response.status_code));
+        }
+
+        JsonPtr root = LoadJson(response.body);
+        ThrowIfGraphQlFailed(root.get());
+        json_t* data = json_object_get(root.get(), "data");
+        json_t* apps = data ? json_object_get(data, "apps") : nullptr;
+        json_t* items = apps ? json_object_get(apps, "items") : nullptr;
+        if (!json_is_array(items))
+            continue;
+
+        size_t item_index = 0;
+        json_t* item = nullptr;
+        json_array_foreach(items, item_index, item)
+        {
+            GameInfo metadata = ParseApp(item);
+            const auto target = game_by_id.find(metadata.id);
+            if (target != game_by_id.end())
+                MergeGame(games[target->second], metadata);
+        }
+    }
+}
+
 PublicGame ToPublicGame(const GameInfo& source)
 {
     PublicGame game;
@@ -2161,7 +2438,16 @@ PublicGame ToPublicGame(const GameInfo& source)
     game.launch_app_id         = source.launch_app_id;
     game.title                 = source.title;
     game.publisher             = source.publisher;
+    game.developer             = source.developer;
+    game.description           = source.description;
     game.image_url             = source.image_url;
+    game.poster_url            = source.poster_url;
+    game.hero_url              = source.hero_url;
+    game.screenshots           = source.screenshots;
+    game.genres                = source.genres;
+    game.feature_labels        = source.feature_labels;
+    game.content_ratings       = source.content_ratings;
+    game.supported_controls    = source.supported_controls;
     game.membership_tier_label = source.membership_tier_label;
     game.is_in_library         = source.is_in_library;
     game.variants              = source.variants;
@@ -2214,9 +2500,9 @@ query GetFilterBrowseResults($vpcId: String!, $locale: String!, $sortString: Str
     numberReturned numberSupported
     pageInfo { hasNextPage endCursor totalCount }
     items {
-      id title longDescription shortDescription publisherName
-      images { KEY_ART GAME_BOX_ART TV_BANNER HERO_IMAGE }
-      variants { id appStore gfn { status library { status selected } } }
+      id title longDescription shortDescription publisherName developerName genres
+      images { KEY_ART GAME_BOX_ART TV_BANNER HERO_IMAGE SCREENSHOTS SCREENSHOT_THUMB }
+      variants { id appStore supportedControls gfn { status library { status selected } } }
       gfn { playabilityState minimumMembershipTierLabel }
     }
   }
@@ -2227,9 +2513,9 @@ query GetSearchFilterResults($vpcId: String!, $locale: String!, $sortString: Str
     numberReturned numberSupported
     pageInfo { hasNextPage endCursor totalCount }
     items {
-      id title longDescription shortDescription publisherName
-      images { KEY_ART GAME_BOX_ART TV_BANNER HERO_IMAGE }
-      variants { id appStore gfn { status library { status selected } } }
+      id title longDescription shortDescription publisherName developerName genres
+      images { KEY_ART GAME_BOX_ART TV_BANNER HERO_IMAGE SCREENSHOTS SCREENSHOT_THUMB }
+      variants { id appStore supportedControls gfn { status library { status selected } } }
       gfn { playabilityState minimumMembershipTierLabel }
     }
   }
@@ -2299,2174 +2585,9 @@ std::string BuildSteamImageUrl(const std::string& steam_url)
 
 } // namespace
 
-GfnClient::GfnClient()
-    : device_id_(NormalizeCloudDeviceId(GenerateDeviceId()))
-{
-    if (device_id_.empty())
-        throw std::runtime_error("Unable to create a stable GeForce NOW device identity");
-}
-
-std::vector<LoginProvider> GfnClient::FetchLoginProviders() const
-{
-    const HttpResponse response = http_client_.Get(
-        kServiceUrlsEndpoint,
-        kUserAgent,
-        {"Accept: application/json"});
-
-    if (response.status_code != 200)
-    {
-        throw std::runtime_error(
-            "Provider discovery failed with HTTP " + std::to_string(response.status_code));
-    }
-
-    JsonPtr root = LoadJson(response.body);
-    json_t* gfn_service_info =
-        json_object_get(root.get(), "gfnServiceInfo");
-    json_t* endpoints =
-        gfn_service_info ? json_object_get(gfn_service_info, "gfnServiceEndpoints") : nullptr;
-
-    std::vector<LoginProvider> providers;
-    if (json_is_array(endpoints))
-    {
-        size_t index = 0;
-        json_t* entry = nullptr;
-        json_array_foreach(endpoints, index, entry)
-        {
-            LoginProvider provider;
-            provider.idp_id                = GetString(entry, "idpId");
-            provider.code                  = GetString(entry, "loginProviderCode");
-            provider.display_name          = GetString(entry, "loginProviderDisplayName");
-            provider.streaming_service_url = EnsureTrailingSlash(GetString(entry, "streamingServiceUrl"));
-            provider.priority              = GetInteger(entry, "loginProviderPriority", 0);
-
-            if (provider.code == "BPC")
-                provider.display_name = "bro.game";
-
-            if (!provider.idp_id.empty() && !provider.streaming_service_url.empty())
-                providers.push_back(provider);
-        }
-    }
-
-    if (providers.empty())
-        providers.push_back(DefaultProvider());
-
-    std::sort(
-        providers.begin(),
-        providers.end(),
-        [](const LoginProvider& left, const LoginProvider& right) {
-            return left.priority < right.priority;
-        });
-
-    return providers;
-}
-
-std::vector<PublicGame> GfnClient::FetchPublicGames() const
-{
-    const HttpResponse response = http_client_.Get(
-        kPublicCatalogEndpoint,
-        kUserAgent,
-        {"Accept: application/json"});
-
-    if (response.status_code != 200)
-    {
-        throw std::runtime_error(
-            "Public catalog fetch failed with HTTP " + std::to_string(response.status_code));
-    }
-
-    JsonPtr root = LoadJson(response.body);
-    if (!json_is_array(root.get()))
-        throw std::runtime_error("Public catalog payload is not a JSON array");
-
-    std::vector<PublicGame> games;
-
-    size_t index = 0;
-    json_t* item = nullptr;
-    json_array_foreach(root.get(), index, item)
-    {
-        const std::string status = GetString(item, "status");
-        const std::string title  = GetString(item, "title");
-        if (status != "AVAILABLE" || title.empty())
-            continue;
-
-        PublicGame game;
-        game.id        = GetString(item, "id");
-        game.title     = title;
-        game.store     = InferStore(item);
-        game.publisher = GetString(item, "publisher");
-        game.image_url = BuildSteamImageUrl(GetString(item, "steamUrl"));
-        if (game.id.empty())
-            game.id = game.title;
-
-        games.push_back(std::move(game));
-    }
-
-    std::sort(
-        games.begin(),
-        games.end(),
-        [](const PublicGame& left, const PublicGame& right) {
-            return left.title < right.title;
-        });
-
-    return games;
-}
-
-std::vector<PublicGame> GfnClient::FetchCatalogGames(
-    AuthSession& session, const std::string& search_query) const
-{
-    session = RecoverSavedSession(session);
-    std::string jwt_token = ResolveSessionJwt(session);
-    const std::string vpc_id = ResolveVpcId(http_client_, session);
-
-    std::vector<PublicGame> games;
-    std::unordered_set<std::string> seen_ids;
-    std::string cursor;
-
-    for (int page = 0; page < 3; ++page)
-    {
-        HttpResponse response = http_client_.Post(
-            kGraphQlEndpoint,
-            kUserAgent,
-            BuildGraphQlPostHeaders(jwt_token),
-            BuildCatalogRequestBody(vpc_id, search_query, cursor));
-
-        if (response.status_code == 401)
-        {
-            session = RecoverSavedSession(session, true);
-            jwt_token = ResolveSessionJwt(session);
-            response = http_client_.Post(
-                kGraphQlEndpoint,
-                kUserAgent,
-                BuildGraphQlPostHeaders(jwt_token),
-                BuildCatalogRequestBody(vpc_id, search_query, cursor));
-        }
-
-        if (response.status_code != 200)
-        {
-            throw std::runtime_error(
-                "Catalog browse failed with HTTP " + std::to_string(response.status_code));
-        }
-
-        JsonPtr root = LoadJson(response.body);
-        bool has_next_page = false;
-        std::string end_cursor;
-        std::vector<PublicGame> page_games =
-            ParseCatalogPage(root, has_next_page, end_cursor);
-        for (PublicGame& game : page_games)
-        {
-            const std::string key = game.id.empty() ? game.title : game.id;
-            if (seen_ids.insert(key).second)
-                games.push_back(std::move(game));
-        }
-
-        if (!has_next_page || end_cursor.empty() || end_cursor == cursor)
-            break;
-        cursor = std::move(end_cursor);
-    }
-
-    return games;
-}
-
-AuthSession GfnClient::Login(const LoginProvider& provider, const std::string& login_hint) const
-{
-    AppendAuthLog("auth: login started provider=" + provider.code);
-
-    const PkcePair pkce = GeneratePkce();
-    const std::string state = HexEncode(GenerateRandomBytes(32).data(), 32);
-    const std::string auth_url = BuildAuthorizeUrl(provider, pkce, state, kRedirectUri, login_hint);
-    const std::string final_url = RunBrowserLogin(auth_url);
-
-    if (GetQueryValue(final_url, "state") != state)
-        throw std::runtime_error("GeForce NOW login callback failed the OAuth state check");
-
-    const std::string error = GetQueryValue(final_url, "error");
-    if (!error.empty())
-    {
-        throw std::runtime_error("GeForce NOW login failed: " + error);
-    }
-
-    const std::string code = GetQueryValue(final_url, "code");
-    if (code.empty())
-        throw std::runtime_error("The GeForce NOW login callback did not include an authorization code");
-
-    AuthTokens tokens = ExchangeAuthorizationCode(http_client_, code, pkce.verifier);
-    AppendAuthLog("auth: token exchange ok");
-    RequestClientToken(http_client_, tokens);
-
-    AuthSession session;
-    session.provider = provider;
-    session.tokens   = tokens;
-    session.user     = FetchUserInfo(http_client_, tokens);
-    session.last_refresh_at_ms = NowMs();
-    AppendAuthLog("auth: user info ok user_id_present=" + std::string(session.user.user_id.empty() ? "no" : "yes"));
-    return session;
-}
-
-AuthSession GfnClient::LoginNative(
-    const LoginProvider& provider,
-    const std::string& email,
-    const std::string& password,
-    const std::function<std::string(const std::string&)>& request_one_time_code,
-    const std::function<void(const std::string&)>& report_status,
-    const std::function<bool()>& is_cancelled) const
-{
-    if (Trim(email).empty() || password.empty())
-        throw std::runtime_error("Email and password are required");
-
-    AppendAuthLog("auth-native: login started provider=" + provider.code);
-    const PkcePair pkce = GeneratePkce();
-    const std::string state = HexEncode(GenerateRandomBytes(32).data(), 32);
-    const std::string auth_url = BuildAuthorizeUrl(provider, pkce, state, kRedirectUri, Trim(email));
-    NativeAuthHttpSession native_http;
-
-    std::string current_url = auth_url;
-    std::string key;
-    for (int redirect = 0; redirect < 12; ++redirect)
-    {
-        if (current_url.rfind("https://login.nvgs.nvidia.com/", 0) == 0)
-        {
-            key = GetQueryValue(current_url, "key");
-            if (!key.empty())
-                break;
-        }
-        const NativeAuthResponse response = native_http.Request("GET", current_url);
-        if (response.location.empty())
-            break;
-        current_url = ResolveRedirectUrl(current_url, response.location);
-    }
-    if (key.empty())
-        throw NativeLoginFallbackRequired("NVIDIA did not offer its native password sign-in flow");
-    AppendAuthLog("auth-native: OAuth context initialized");
-
-    JsonPtr account_body(json_object(), &json_decref);
-    json_object_set_new(account_body.get(), "email", json_string(Trim(email).c_str()));
-    json_object_set_new(account_body.get(), "rememberLogin", json_true());
-    json_object_set_new(account_body.get(), "autoLogin", json_false());
-    json_object_set_new(account_body.get(), "deviceId", json_string(GenerateDeviceId().c_str()));
-    JsonPtr account = NativeJsonRequest(
-        native_http, "POST",
-        "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth/account/check",
-        key, account_body.get(), true);
-    key = GetString(account.get(), "key");
-    if (key.empty())
-        throw std::runtime_error("NVIDIA account check did not return a login context");
-
-    NativeStage stage = AdvanceNativeStage(native_http, key);
-    bool password_submitted = false;
-    for (int transitions = 0; transitions < 24; ++transitions)
-    {
-        if (is_cancelled && is_cancelled())
-            throw std::runtime_error("NVIDIA sign-in was cancelled");
-        const auth::NativeStageAction stage_action = auth::ClassifyNativeStage(stage.page);
-        if (stage_action == auth::NativeStageAction::Password)
-        {
-            if (password_submitted)
-                throw std::runtime_error("NVIDIA rejected the supplied account credentials");
-            JsonPtr body(json_object(), &json_decref);
-            json_object_set_new(body.get(), "password", json_string(password.c_str()));
-            json_object_set_new(body.get(), "rememberLogin", json_true());
-            json_object_set_new(body.get(), "deviceId", json_string(GenerateDeviceId().c_str()));
-            JsonPtr result = NativeJsonRequest(
-                native_http, "POST",
-                "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth/user/login/password",
-                stage.key, body.get(), true);
-            key = GetString(result.get(), "key");
-            if (key.empty())
-                throw std::runtime_error("NVIDIA password login did not return a login context");
-            password_submitted = true;
-            AppendAuthLog("auth-native: password accepted");
-            stage = AdvanceNativeStage(native_http, key);
-            continue;
-        }
-
-        if (stage_action == auth::NativeStageAction::SelectMfa)
-        {
-            const std::string capability = UrlEncode("[\"TOTP\"]");
-            JsonPtr factors = NativeJsonRequest(
-                native_http, "GET",
-                "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth/auth/factor/challenge/factors"
-                "?browserCapability=" + capability,
-                stage.key, nullptr);
-            json_t* values = json_object_get(factors.get(), "values");
-            if (!json_is_array(values))
-            {
-                json_t* nested = json_object_get(factors.get(), "factors");
-                values = json_is_object(nested) ? json_object_get(nested, "values") : nested;
-            }
-            json_t* selected_totp = nullptr;
-            json_t* selected_email = nullptr;
-            std::vector<std::string> factor_types;
-            if (json_is_array(values))
-            {
-                size_t index = 0;
-                json_t* item = nullptr;
-                json_array_foreach(values, index, item)
-                {
-                    const std::string type = GetString(item, "type");
-                    const std::string normalized = Lowercase(type);
-                    if (!type.empty())
-                        factor_types.push_back(type);
-                    if (normalized == "totp")
-                        selected_totp = item;
-                    else if (normalized == "email" || normalized == "emailcode")
-                        selected_email = item;
-                }
-            }
-            std::string factor_summary;
-            for (const std::string& type : factor_types)
-            {
-                if (!factor_summary.empty())
-                    factor_summary += ",";
-                factor_summary += type;
-            }
-            AppendAuthLog(
-                "auth-native: MFA factors count=" + std::to_string(factor_types.size()) +
-                " types=" + (factor_summary.empty() ? std::string("none") : factor_summary));
-            json_t* selected = selected_totp ? selected_totp : selected_email;
-            if (!selected)
-                throw NativeLoginFallbackRequired(
-                    "This account requires a security key, passkey, email approval, or another unsupported verification method");
-
-            std::string factor_id = GetString(selected, "id");
-            json_t* descriptors = json_object_get(selected, "descriptors");
-            if (factor_id.empty() && json_is_array(descriptors) && json_array_size(descriptors) > 0)
-                factor_id = GetString(json_array_get(descriptors, 0), "id");
-
-            const std::string selected_type = GetString(selected, "type");
-            JsonPtr init_body(json_object(), &json_decref);
-            json_object_set_new(init_body.get(), "type", json_string(selected_type.c_str()));
-            if (factor_id.empty())
-                json_object_set_new(init_body.get(), "id", json_null());
-            else
-                json_object_set_new(init_body.get(), "id", json_string(factor_id.c_str()));
-            JsonPtr initialized = NativeJsonRequest(
-                native_http, "POST",
-                "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth/auth/factor/challenge/initialize",
-                stage.key, init_body.get());
-            key = GetString(initialized.get(), "key");
-            if (key.empty())
-                throw std::runtime_error("NVIDIA MFA initialization did not return a login context");
-            AppendAuthLog("auth-native: MFA initialized type=" + selected_type);
-            stage = AdvanceNativeStage(native_http, key);
-            continue;
-        }
-
-        if (stage_action == auth::NativeStageAction::VerifyTotp)
-        {
-            if (!request_one_time_code)
-                throw NativeLoginFallbackRequired("A NVIDIA authenticator code is required");
-            const std::string otp = Trim(request_one_time_code("Enter the 6-digit NVIDIA authenticator code"));
-            if (otp.empty())
-                throw std::runtime_error("NVIDIA verification was cancelled");
-            JsonPtr verify_body(json_object(), &json_decref);
-            json_object_set_new(verify_body.get(), "otp", json_string(otp.c_str()));
-            JsonPtr verified = NativeJsonRequest(
-                native_http, "POST",
-                "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth/auth/factor/challenge/verify",
-                stage.key, verify_body.get());
-            key = GetString(verified.get(), "key");
-            if (key.empty())
-                throw std::runtime_error("NVIDIA MFA verification did not return a login context");
-            AppendAuthLog("auth-native: TOTP accepted");
-            stage = AdvanceNativeStage(native_http, key);
-            continue;
-        }
-
-        if (stage_action == auth::NativeStageAction::WaitForEmail)
-        {
-            if (report_status)
-                report_status("NVIDIA sent an approval email. Open it and approve this sign-in.");
-            AppendAuthLog("auth-native: waiting for email approval");
-            bool approved = false;
-            for (int attempt = 1; attempt <= 60; ++attempt)
-            {
-                if (is_cancelled && is_cancelled())
-                    throw std::runtime_error("NVIDIA sign-in was cancelled");
-                if (report_status && (attempt == 1 || attempt % 5 == 0))
-                {
-                    const int elapsed_seconds = (attempt - 1) * 3;
-                    report_status(
-                        "NVIDIA sent an approval email. Open it and approve this sign-in. "
-                        "Waiting: " + std::to_string(elapsed_seconds) +
-                        " seconds (timeout: 180 seconds). Check Spam if needed.");
-                }
-                const NativeAuthResponse response = native_http.Request(
-                    "GET",
-                    "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth/user/email/auth/poll",
-                    NativeAuthHeaders(stage.key));
-                if (response.status_code == 200)
-                {
-                    JsonPtr result = LoadJson(response.body);
-                    key = GetString(result.get(), "key");
-                    if (key.empty())
-                        throw std::runtime_error("NVIDIA email approval returned no login context");
-                    AppendAuthLog("auth-native: email approval accepted attempts=" + std::to_string(attempt));
-                    stage = AdvanceNativeStage(native_http, key);
-                    approved = true;
-                    break;
-                }
-                if (response.status_code == 202 || response.status_code == 400 ||
-                    response.status_code == 404 || response.status_code == 429 ||
-                    response.status_code >= 500)
-                {
-                    if (attempt == 1 || attempt % 10 == 0)
-                    {
-                        AppendAuthLog(
-                            "auth-native: email approval pending HTTP=" +
-                            std::to_string(response.status_code) +
-                            " attempt=" + std::to_string(attempt));
-                    }
-                    std::this_thread::sleep_for(std::chrono::seconds(3));
-                    continue;
-                }
-                throw std::runtime_error(
-                    "NVIDIA email approval failed with HTTP " +
-                    std::to_string(response.status_code));
-            }
-            if (!approved)
-                throw std::runtime_error("NVIDIA email approval timed out after 3 minutes");
-            continue;
-        }
-
-        if (stage_action == auth::NativeStageAction::Consent)
-        {
-            JsonPtr consent(json_object(), &json_decref);
-            JsonPtr accepted = NativeJsonRequest(
-                native_http, "POST",
-                "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth/user/consent",
-                stage.key, consent.get());
-            key = GetString(accepted.get(), "key");
-            if (key.empty())
-                throw NativeLoginFallbackRequired("NVIDIA requires an interactive consent screen");
-            stage = AdvanceNativeStage(native_http, key);
-            continue;
-        }
-
-        if (stage_action == auth::NativeStageAction::Advance)
-        {
-            stage = AdvanceNativeStage(native_http, stage.key);
-            continue;
-        }
-
-        if (stage_action == auth::NativeStageAction::Finish)
-        {
-            current_url = stage.external_url.empty()
-                ? "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth/user/next?key=" +
-                    UrlEncode(stage.key) + "&state=finish"
-                : stage.external_url;
-            std::string final_url;
-            for (int redirect = 0; redirect < 16; ++redirect)
-            {
-                if (current_url.rfind(kRedirectUri, 0) == 0)
-                {
-                    final_url = current_url;
-                    break;
-                }
-                const NativeAuthResponse response = native_http.Request("GET", current_url);
-                if (response.location.empty())
-                    break;
-                current_url = ResolveRedirectUrl(current_url, response.location);
-            }
-            if (final_url.empty())
-                throw std::runtime_error("NVIDIA login completed without an OAuth callback");
-            if (GetQueryValue(final_url, "state") != state)
-                throw std::runtime_error("NVIDIA native login failed the OAuth state check");
-            const std::string error = GetQueryValue(final_url, "error");
-            if (!error.empty())
-                throw std::runtime_error("NVIDIA native login failed: " + error);
-            const std::string code = GetQueryValue(final_url, "code");
-            if (code.empty())
-                throw std::runtime_error("NVIDIA native login did not return an authorization code");
-
-            AuthTokens tokens = ExchangeAuthorizationCode(http_client_, code, pkce.verifier);
-            RequestClientToken(http_client_, tokens);
-            AuthSession auth_session;
-            auth_session.provider = provider;
-            auth_session.tokens = std::move(tokens);
-            auth_session.user = FetchUserInfo(http_client_, auth_session.tokens);
-            auth_session.last_refresh_at_ms = NowMs();
-            AppendAuthLog("auth-native: login complete");
-            return auth_session;
-        }
-
-        if (stage.page == "Captcha")
-            throw NativeLoginFallbackRequired("NVIDIA requires a CAPTCHA for this sign-in");
-
-        throw NativeLoginFallbackRequired(
-            "NVIDIA requires an interactive step not supported by native login: " +
-            (stage.page.empty() ? std::string("unknown") : stage.page));
-    }
-
-    throw std::runtime_error("NVIDIA native login exceeded the stage transition limit");
-}
-
-class QrCallbackServer
-{
-  public:
-    explicit QrCallbackServer(const std::string& auth_url) : auth_url_(auth_url) {}
-
-    ~QrCallbackServer()
-    {
-        Stop();
-    }
-
-    void Start()
-    {
-        const int server = socket(AF_INET, SOCK_STREAM, 0);
-        if (server < 0)
-            throw std::runtime_error("QR callback server socket() failed");
-
-#ifndef _WIN32
-        int reuse = 1;
-        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&reuse), sizeof(reuse));
-#endif
-
-        sockaddr_in address {};
-        address.sin_family      = AF_INET;
-        address.sin_port        = htons(kLoginCallbackPort);
-        address.sin_addr.s_addr = INADDR_ANY;
-
-        if (bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0)
-        {
-            close(server);
-            throw std::runtime_error(std::string("QR callback server bind() failed on port ") + std::to_string(kLoginCallbackPort));
-        }
-
-        port_ = kLoginCallbackPort;
-
-        if (listen(server, 1) < 0)
-        {
-            close(server);
-            throw std::runtime_error("QR callback server listen() failed");
-        }
-
-        AppendAuthLog("auth: QR callback server listening on fixed port " + std::to_string(port_));
-
-        worker_ = std::thread([this, server]() {
-            Run(server);
-        });
-    }
-
-    void Stop()
-    {
-        stop_ = true;
-        if (worker_.joinable())
-            worker_.join();
-    }
-
-    std::string WaitForResult(std::function<bool()> isCancelled)
-    {
-        while (!completed_ && !stop_)
-        {
-            if (isCancelled && isCancelled())
-            {
-                Stop();
-                return "";
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        if (!error_.empty())
-            throw std::runtime_error(error_);
-
-        return callback_url_;
-    }
-
-    int port() const
-    {
-        return port_;
-    }
-
-  private:
-    void Complete(std::string callback_url, std::string error = {})
-    {
-        callback_url_ = std::move(callback_url);
-        error_        = std::move(error);
-        completed_    = true;
-    }
-
-    void SendResponse(int client, bool ok)
-    {
-        const std::string body =
-            ok
-                ? "<!doctype html><html><body style=\"font-family:sans-serif;background:#0e1015;color:#fff;padding:32px;text-align:center;\"><h2>SwitchNOW login complete</h2><p style=\"color:#76b900\">You can close this tab and return to your Switch!</p></body></html>"
-                : "<!doctype html><html><body style=\"font-family:sans-serif;background:#0e1015;color:#fff;padding:32px;text-align:center;\"><h2 style=\"color:red\">SwitchNOW login failed</h2><p>Please try again.</p></body></html>";
-
-        const std::string response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html; charset=utf-8\r\n"
-            "Connection: close\r\n"
-            "Content-Length: " +
-            std::to_string(body.size()) + "\r\n\r\n" + body;
-
-        send(client, response.data(), response.size(), 0);
-    }
-
-    void Run(int server)
-    {
-        while (!stop_)
-        {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-            FD_SET(server, &read_fds);
-
-            timeval timeout {};
-            timeout.tv_sec = 1;
-
-            const int ready = select(server + 1, &read_fds, nullptr, nullptr, &timeout);
-            if (ready <= 0)
-                continue;
-
-            const int client = accept(server, nullptr, nullptr);
-            if (client < 0)
-                continue;
-
-            char buffer[2048] {};
-            const ssize_t read_bytes = recv(client, buffer, sizeof(buffer) - 1, 0);
-            if (read_bytes <= 0)
-            {
-                close(client);
-                continue;
-            }
-
-            const std::string request(buffer, static_cast<size_t>(read_bytes));
-            const auto first_space  = request.find(' ');
-            const auto second_space = first_space == std::string::npos
-                                          ? std::string::npos
-                                          : request.find(' ', first_space + 1);
-
-            std::string target =
-                first_space == std::string::npos || second_space == std::string::npos
-                    ? std::string("/")
-                    : request.substr(first_space + 1, second_space - first_space - 1);
-
-            if (target == "/")
-            {
-                std::string body = R"html(<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body { font-family: sans-serif; background: #0e1015; color: #fff; padding: 20px; text-align: center; }
-.btn { display: inline-block; background: #76b900; color: #000; padding: 15px 30px; text-decoration: none; font-weight: bold; border-radius: 5px; margin: 20px 0; font-size: 18px; }
-input { width: 100%; padding: 15px; box-sizing: border-box; margin: 10px 0; border: none; border-radius: 5px; font-size: 16px; color: #000; }
-.instructions { text-align: left; background: #1a1e24; padding: 15px; border-radius: 5px; margin-bottom: 20px; font-size: 15px; line-height: 1.4; }
-</style></head><body><h2>GeForce NOW Login</h2>
-<div class="instructions"><p>This Switch login page always runs on port <b>2259</b>.</p><p>1. Tap the button below to log in to NVIDIA.</p><p>2. After logging in, your browser will show an error like "Site cannot be reached" for <b>localhost:2259</b>.</p>
-<p>3. <b>Copy the full URL</b> from your browser's address bar.</p><p>4. Go back to this page and paste the URL below.</p></div>
-<a href=")html" + auth_url_ + R"html(" target="_blank" class="btn">Login to NVIDIA</a>
-<input type="text" id="pastedUrl" placeholder="Paste the localhost URL here...">
-<a href="#" class="btn" onclick="submitUrl()">Submit</a>
-<script>
-function submitUrl() {
-  var url = document.getElementById('pastedUrl').value;
-  if (!url) return;
-  window.location.href = '/callback?url=' + encodeURIComponent(url);
-}
-</script></body></html>)html";
-
-                const std::string response =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/html; charset=utf-8\r\n"
-                    "Connection: close\r\n"
-                    "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
-
-                send(client, response.data(), response.size(), 0);
-                close(client);
-                continue;
-            }
-
-            if (target.find("/callback?url=") == 0)
-            {
-                std::string pasted_url = UrlDecode(target.substr(14));
-                target = pasted_url;
-            }
-
-            const bool has_code  = !GetQueryValue(target, "code").empty();
-            const bool has_error = !GetQueryValue(target, "error").empty();
-            const bool is_callback = has_code || has_error;
-            
-            if (is_callback) {
-                SendResponse(client, has_code && !has_error);
-            } else {
-                const std::string response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                send(client, response.data(), response.size(), 0);
-            }
-            
-            close(client);
-
-            if (is_callback)
-            {
-                Complete(target);
-                break;
-            }
-        }
-
-        close(server);
-    }
-
-    std::atomic<bool> stop_ {false};
-    std::thread worker_;
-    std::atomic<bool> completed_ {false};
-    std::string callback_url_;
-    std::string error_;
-    std::string auth_url_;
-    int port_ = 0;
-};
-
-AuthSession GfnClient::ReauthenticateWithSavedCredentials(
-    const AuthSession& expired_session,
-    const std::function<void(const std::string&)>& report_status,
-    const std::function<bool()>& is_cancelled) const
-{
-    // Store, Library and the periodic account check can notice the same
-    // expired token together. Keep native login single-flight and reuse a
-    // session another request has just restored.
-    std::lock_guard<std::mutex> reauthentication_lock(g_reauthentication_mutex);
-    for (const AuthSession& candidate : LoadSavedSessions())
-    {
-        const bool same_user = candidate.user.user_id == expired_session.user.user_id;
-        const bool newer_login = candidate.last_refresh_at_ms > expired_session.last_refresh_at_ms;
-        const bool different_token =
-            candidate.tokens.access_token != expired_session.tokens.access_token;
-        if (!same_user || !newer_login || !different_token)
-            continue;
-
-        try
-        {
-            AuthSession restored = EnsureFreshSavedSession(candidate);
-            restored.reauthentication_required = false;
-            AppendAuthLog("auth: reused quick sign-in completed by another request");
-            return restored;
-        }
-        catch (const ReauthenticationRequired&)
-        {
-            // The newer token was rejected too; continue with the remembered
-            // credentials while holding the single-flight lock.
-        }
-    }
-
-    const std::optional<NativeCredentials> stored =
-        LoadNativeCredentials(expired_session.provider.idp_id);
-    if (!stored || stored->email.empty() || stored->password.empty())
-    {
-        throw ReauthenticationRequired(
-            "The NVIDIA session expired and no password is saved for automatic sign-in.");
-    }
-
-    NativeCredentials credentials = *stored;
-    AppendAuthLog("auth: automatic quick sign-in started provider=" +
-                  expired_session.provider.code);
-    try
-    {
-        AuthSession restored = LoginNative(
-            expired_session.provider,
-            credentials.email,
-            credentials.password,
-            [](const std::string&) { return std::string {}; },
-            report_status,
-            is_cancelled);
-        std::fill(credentials.password.begin(), credentials.password.end(), '\0');
-        restored.persistence_enabled = true;
-        restored.reauthentication_required = false;
-        SaveSession(restored);
-        AppendAuthLog("auth: automatic quick sign-in completed user_id_present=" +
-                      std::string(restored.user.user_id.empty() ? "no" : "yes"));
-        return restored;
-    }
-    catch (...)
-    {
-        std::fill(credentials.password.begin(), credentials.password.end(), '\0');
-        AppendAuthLog("auth: automatic quick sign-in failed");
-        throw;
-    }
-}
-
-AuthSession GfnClient::RecoverSavedSession(
-    const AuthSession& session,
-    bool force_refresh,
-    const std::function<void(const std::string&)>& report_status,
-    const std::function<bool()>& is_cancelled) const
-{
-    if (session.reauthentication_required)
-    {
-        if (report_status)
-            report_status("Restoring the remembered NVIDIA account.");
-        return ReauthenticateWithSavedCredentials(session, report_status, is_cancelled);
-    }
-
-    try
-    {
-        AuthSession recovered = force_refresh
-            ? ForceRefreshSavedSession(session)
-            : EnsureFreshSavedSession(session);
-        recovered.reauthentication_required = false;
-        return recovered;
-    }
-    catch (const ReauthenticationRequired&)
-    {
-        if (report_status)
-            report_status("Saved authorization expired. Starting quick sign-in.");
-        return ReauthenticateWithSavedCredentials(session, report_status, is_cancelled);
-    }
-}
-
-AuthSession GfnClient::LoginSwitchQR(const LoginProvider& provider, std::function<void(const std::string&)> onUrlGenerated, std::function<bool()> isCancelled) const
-{
-    AppendAuthLog("auth: QR login started provider=" + provider.code);
-
-    const PkcePair pkce = GeneratePkce();
-    const std::string state = HexEncode(GenerateRandomBytes(32).data(), 32);
-    
-    std::string local_ip = NetworkUtils::GetLocalIPAddress();
-    if (local_ip == "127.0.0.1" || local_ip.empty()) {
-        throw std::runtime_error("Could not determine local IP address. Are you connected to Wi-Fi?");
-    }
-
-    const std::string auth_url = BuildAuthorizeUrl(provider, pkce, state, std::string(kRedirectUri));
-
-    QrCallbackServer callback_server(auth_url);
-    callback_server.Start();
-
-    std::string switch_url = "http://" + local_ip + ":" + std::to_string(callback_server.port()) + "/";
-
-    if (onUrlGenerated)
-        onUrlGenerated(switch_url);
-
-    const std::string final_url = callback_server.WaitForResult(isCancelled);
-    if (final_url.empty())
-    {
-        throw std::runtime_error("Login was cancelled or timed out.");
-    }
-
-    if (GetQueryValue(final_url, "state") != state)
-        throw std::runtime_error("GeForce NOW login callback failed the OAuth state check");
-
-    const std::string error = GetQueryValue(final_url, "error");
-    if (!error.empty())
-    {
-        throw std::runtime_error("GeForce NOW login failed: " + error);
-    }
-
-    const std::string code = GetQueryValue(final_url, "code");
-    if (code.empty())
-        throw std::runtime_error("The GeForce NOW login callback did not include an authorization code");
-
-    AuthTokens tokens = ExchangeAuthorizationCode(http_client_, code, pkce.verifier);
-    AppendAuthLog("auth: token exchange ok");
-    RequestClientToken(http_client_, tokens);
-
-    AuthSession session;
-    session.provider = provider;
-    session.tokens   = tokens;
-    session.user     = FetchUserInfo(http_client_, tokens);
-    session.last_refresh_at_ms = NowMs();
-    AppendAuthLog("auth: user info ok user_id_present=" + std::string(session.user.user_id.empty() ? "no" : "yes"));
-    return session;
-}
-
-AuthSession GfnClient::EnsureFreshSession(const AuthSession& session) const
-{
-    const bool access_needs_refresh = IsNearExpiry(session.tokens.expires_at_ms);
-    const bool client_needs_refresh = session.tokens.client_token.empty() ||
-        IsNearExpiry(session.tokens.client_token_expires_at_ms);
-
-    if (!access_needs_refresh && !client_needs_refresh)
-        return session;
-
-    AuthSession refreshed = session;
-
-    if (access_needs_refresh && session.tokens.refresh_token.empty())
-    {
-        if (IsExpired(session.tokens.expires_at_ms))
-            throw ReauthenticationRequired("Saved GeForce NOW login has expired. Please sign in again.");
-    }
-    else if (access_needs_refresh)
-    {
-        AppendAuthLog("auth: refreshing access token user_id_present=" +
-                      std::string(session.user.user_id.empty() ? "no" : "yes"));
-        refreshed.tokens = RefreshTokens(http_client_, session);
-        refreshed.last_refresh_at_ms = NowMs();
-        AppendAuthLog("auth: access token refresh ok");
-    }
-
-    if (refreshed.tokens.client_token.empty() ||
-        IsNearExpiry(refreshed.tokens.client_token_expires_at_ms))
-    {
-        RequestClientToken(http_client_, refreshed.tokens);
-    }
-    return refreshed;
-}
-
-AuthSession GfnClient::EnsureFreshSavedSession(const AuthSession& session) const
-{
-    if (!session.persistence_enabled)
-        return EnsureFreshSession(session);
-
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    AuthSession source = session;
-    for (const AuthSession& saved : LoadAccountsFromDisk(nullptr))
-    {
-        if (saved.user.user_id == session.user.user_id &&
-            (saved.last_refresh_at_ms > source.last_refresh_at_ms ||
-             saved.tokens.expires_at_ms > source.tokens.expires_at_ms))
-        {
-            source = saved;
-        }
-    }
-
-    AuthSession refreshed = EnsureFreshSession(source);
-    const bool changed =
-        refreshed.tokens.access_token != source.tokens.access_token ||
-        refreshed.tokens.refresh_token != source.tokens.refresh_token ||
-        refreshed.tokens.id_token != source.tokens.id_token ||
-        refreshed.tokens.client_token != source.tokens.client_token ||
-        refreshed.tokens.expires_at_ms != source.tokens.expires_at_ms ||
-        refreshed.tokens.client_token_expires_at_ms != source.tokens.client_token_expires_at_ms ||
-        refreshed.last_refresh_at_ms != source.last_refresh_at_ms;
-    if (changed)
-        SaveSession(refreshed);
-    return refreshed;
-}
-
-AuthSession GfnClient::ForceRefreshSavedSession(const AuthSession& session) const
-{
-    if (!session.persistence_enabled)
-    {
-        AuthSession refreshed = session;
-        refreshed.tokens = RefreshTokens(http_client_, session);
-        if (refreshed.tokens.client_token.empty() ||
-            IsNearExpiry(refreshed.tokens.client_token_expires_at_ms))
-        {
-            RequestClientToken(http_client_, refreshed.tokens);
-        }
-        refreshed.last_refresh_at_ms = NowMs();
-        return refreshed;
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    AuthSession source = session;
-    for (const AuthSession& saved : LoadAccountsFromDisk(nullptr))
-    {
-        if (saved.user.user_id == session.user.user_id &&
-            (saved.last_refresh_at_ms > source.last_refresh_at_ms ||
-             saved.tokens.expires_at_ms > source.tokens.expires_at_ms))
-        {
-            source = saved;
-        }
-    }
-
-    AppendAuthLog("auth: forced refresh after authorization failure user_id_present=" +
-                  std::string(source.user.user_id.empty() ? "no" : "yes"));
-    AuthSession refreshed = source;
-    refreshed.tokens = RefreshTokens(http_client_, source);
-    if (refreshed.tokens.client_token.empty() ||
-        IsNearExpiry(refreshed.tokens.client_token_expires_at_ms))
-    {
-        RequestClientToken(http_client_, refreshed.tokens);
-    }
-    refreshed.last_refresh_at_ms = NowMs();
-    SaveSession(refreshed);
-    return refreshed;
-}
-
-bool ParseSessionObject(json_t* root, AuthSession& session)
-{
-    if (!root || !json_is_object(root))
-        return false;
-
-    session.provider.idp_id                = GetString(json_object_get(root, "provider"), "idp_id");
-    session.provider.code                  = GetString(json_object_get(root, "provider"), "code");
-    session.provider.display_name          = GetString(json_object_get(root, "provider"), "display_name");
-    session.provider.streaming_service_url =
-        EnsureTrailingSlash(GetString(json_object_get(root, "provider"), "streaming_service_url"));
-    session.provider.priority = GetInteger(json_object_get(root, "provider"), "priority", 0);
-
-    json_t* tokens = json_object_get(root, "tokens");
-    session.tokens.access_token  = GetString(tokens, "access_token");
-    session.tokens.refresh_token = GetString(tokens, "refresh_token");
-    session.tokens.id_token      = GetString(tokens, "id_token");
-    session.tokens.client_token  = GetString(tokens, "client_token");
-
-    json_t* expires = tokens ? json_object_get(tokens, "expires_at_ms") : nullptr;
-    if (json_is_integer(expires))
-        session.tokens.expires_at_ms = static_cast<std::int64_t>(json_integer_value(expires));
-
-    json_t* client_expires = tokens ? json_object_get(tokens, "client_token_expires_at_ms") : nullptr;
-    if (json_is_integer(client_expires))
-    {
-        session.tokens.client_token_expires_at_ms =
-            static_cast<std::int64_t>(json_integer_value(client_expires));
-    }
-
-    json_t* user = json_object_get(root, "user");
-    session.user.user_id         = GetString(user, "user_id");
-    session.user.display_name    = GetString(user, "display_name");
-    session.user.email           = GetString(user, "email");
-    session.user.avatar_url      = GetString(user, "avatar_url");
-    session.user.membership_tier = GetString(user, "membership_tier");
-    if (session.user.membership_tier.empty())
-        session.user.membership_tier = "FREE";
-
-    json_t* last_refresh = json_object_get(root, "last_refresh_at_ms");
-    if (json_is_integer(last_refresh))
-        session.last_refresh_at_ms = static_cast<std::int64_t>(json_integer_value(last_refresh));
-
-    if (session.provider.idp_id.empty())
-        session.provider = DefaultProvider();
-
-    return !session.tokens.access_token.empty() && !session.user.user_id.empty();
-}
-
-JsonPtr BuildSessionObject(const AuthSession& session)
-{
-    JsonPtr root(json_object(), &json_decref);
-    JsonPtr provider(json_object(), &json_decref);
-    JsonPtr tokens(json_object(), &json_decref);
-    JsonPtr user(json_object(), &json_decref);
-
-    json_object_set_new(provider.get(), "idp_id", json_string(session.provider.idp_id.c_str()));
-    json_object_set_new(provider.get(), "code", json_string(session.provider.code.c_str()));
-    json_object_set_new(provider.get(), "display_name", json_string(session.provider.display_name.c_str()));
-    json_object_set_new(
-        provider.get(),
-        "streaming_service_url",
-        json_string(session.provider.streaming_service_url.c_str()));
-    json_object_set_new(provider.get(), "priority", json_integer(session.provider.priority));
-
-    json_object_set_new(tokens.get(), "access_token", json_string(session.tokens.access_token.c_str()));
-    json_object_set_new(tokens.get(), "refresh_token", json_string(session.tokens.refresh_token.c_str()));
-    json_object_set_new(tokens.get(), "id_token", json_string(session.tokens.id_token.c_str()));
-    json_object_set_new(tokens.get(), "client_token", json_string(session.tokens.client_token.c_str()));
-    json_object_set_new(tokens.get(), "expires_at_ms", json_integer(session.tokens.expires_at_ms));
-    json_object_set_new(
-        tokens.get(),
-        "client_token_expires_at_ms",
-        json_integer(session.tokens.client_token_expires_at_ms));
-
-    json_object_set_new(user.get(), "user_id", json_string(session.user.user_id.c_str()));
-    json_object_set_new(user.get(), "display_name", json_string(session.user.display_name.c_str()));
-    json_object_set_new(user.get(), "email", json_string(session.user.email.c_str()));
-    json_object_set_new(user.get(), "avatar_url", json_string(session.user.avatar_url.c_str()));
-    json_object_set_new(user.get(), "membership_tier", json_string(session.user.membership_tier.c_str()));
-
-    json_object_set_new(root.get(), "provider", json_incref(provider.get()));
-    json_object_set_new(root.get(), "tokens", json_incref(tokens.get()));
-    json_object_set_new(root.get(), "user", json_incref(user.get()));
-    json_object_set_new(root.get(), "last_refresh_at_ms", json_integer(session.last_refresh_at_ms));
-    return root;
-}
-
-void WriteJsonToFile(const std::string& path, json_t* root)
-{
-    char* dump = json_dumps(root, JSON_INDENT(2));
-    if (!dump)
-        throw std::runtime_error("Failed to serialize JSON");
-
-    std::unique_ptr<char, decltype(&std::free)> output(dump, &std::free);
-    WriteTextFileAtomically(path, output.get());
-}
-
-void RememberActiveCloudSession(
-    const AuthSession& auth,
-    const std::string& session_id,
-    const std::string& launch_app_id)
-{
-    if (session_id.empty())
-        return;
-
-    try
-    {
-        JsonPtr root(json_object(), &json_decref);
-        json_object_set_new(root.get(), "session_id", json_string(session_id.c_str()));
-        json_object_set_new(root.get(), "user_id", json_string(auth.user.user_id.c_str()));
-        json_object_set_new(root.get(), "launch_app_id", json_string(launch_app_id.c_str()));
-        json_object_set_new(root.get(), "created_at_ms", json_integer(NowMs()));
-        WriteJsonToFile(GetActiveCloudSessionPath(), root.get());
-    }
-    catch (const std::exception& e)
-    {
-        AppendAuthLog("session: unable to persist active session error=" + std::string(e.what()));
-    }
-}
-
-std::string LoadActiveCloudSessionId(const AuthSession& auth)
-{
-    const std::string body = ReadTextFile(GetActiveCloudSessionPath());
-    if (body.empty())
-        return "";
-
-    try
-    {
-        JsonPtr root = LoadJson(body);
-        if (GetString(root.get(), "user_id") != auth.user.user_id)
-            return "";
-        return GetString(root.get(), "session_id");
-    }
-    catch (...)
-    {
-        return "";
-    }
-}
-
-void ForgetActiveCloudSession(const std::string& session_id)
-{
-    const std::string body = ReadTextFile(GetActiveCloudSessionPath());
-    if (!body.empty())
-    {
-        try
-        {
-            JsonPtr root = LoadJson(body);
-            if (!session_id.empty() && GetString(root.get(), "session_id") != session_id)
-                return;
-        }
-        catch (...) {}
-    }
-
-    std::remove(GetActiveCloudSessionPath().c_str());
-    std::remove((GetActiveCloudSessionPath() + ".bak").c_str());
-}
-
-std::vector<AuthSession> LoadAccountsFromDisk(std::string* active_user_id = nullptr)
-{
-    for (const std::string& path : {GetAccountsPath(), GetAccountsPath() + ".bak"})
-    {
-        const std::string stored = ReadTextFile(path);
-        if (stored.empty())
-            continue;
-
-        try
-        {
-            const std::string body = DecryptTokenVault(stored);
-            JsonPtr root = LoadJson(body);
-            if (!json_is_object(root.get()))
-                continue;
-
-            json_t* accounts = json_object_get(root.get(), "accounts");
-            if (!accounts || !json_is_array(accounts))
-                continue;
-
-            std::vector<AuthSession> sessions;
-            size_t index = 0;
-            json_t* item = nullptr;
-            json_array_foreach(accounts, index, item)
-            {
-                AuthSession session;
-                if (ParseSessionObject(item, session))
-                    sessions.push_back(std::move(session));
-            }
-
-            if (sessions.empty())
-                continue;
-
-            if (active_user_id)
-                *active_user_id = GetString(root.get(), "active_user_id");
-            if (path.find(".bak") != std::string::npos)
-                AppendAuthLog("auth: recovered accounts from backup");
-            else if (stored.rfind(kTokenVaultHeader, 0) != 0)
-            {
-                AppendAuthLog("auth: loaded legacy plaintext account store; migration scheduled");
-                std::string active = GetString(root.get(), "active_user_id");
-                if (active.empty())
-                    active = sessions.front().user.user_id;
-                SaveAccountsToDisk(sessions, active);
-                AppendAuthLog("auth: legacy account store migrated to encrypted vault");
-            }
-            return sessions;
-        }
-        catch (const std::exception& e)
-        {
-            AppendAuthLog("auth: account store parse failed path=" + path + " error=" + e.what());
-        }
-    }
-
-    return {};
-}
-
-void SaveAccountsToDisk(const std::vector<AuthSession>& sessions, const std::string& active_user_id)
-{
-    EnsureAppHome();
-
-    JsonPtr root(json_object(), &json_decref);
-    JsonPtr accounts(json_array(), &json_decref);
-
-    for (const AuthSession& session : sessions)
-    {
-        JsonPtr item = BuildSessionObject(session);
-        json_array_append_new(accounts.get(), json_incref(item.get()));
-    }
-
-    json_object_set_new(root.get(), "schema_version", json_integer(3));
-    json_object_set_new(root.get(), "active_user_id", json_string(active_user_id.c_str()));
-    json_object_set_new(root.get(), "accounts", json_incref(accounts.get()));
-    char* dump = json_dumps(root.get(), JSON_COMPACT | JSON_SORT_KEYS);
-    if (!dump)
-        throw std::runtime_error("Failed to serialize token vault");
-    std::unique_ptr<char, decltype(&std::free)> plaintext(dump, &std::free);
-    const std::string encrypted = EncryptTokenVault(plaintext.get());
-    if (DecryptTokenVault(encrypted) != plaintext.get())
-        throw std::runtime_error("Token vault round-trip verification failed");
-    WriteTextFileAtomically(GetAccountsPath(), encrypted);
-
-    const std::string backup_path = GetAccountsPath() + ".bak";
-    const std::string backup = ReadTextFile(backup_path);
-    if (!backup.empty() && backup.rfind(kTokenVaultHeader, 0) != 0)
-        std::remove(backup_path.c_str());
-
-    // The encrypted multi-account vault replaces the old plaintext session copy.
-    std::remove(GetSessionPath().c_str());
-    std::remove((GetSessionPath() + ".bak").c_str());
-    AppendAuthLog("auth: token vault saved accounts=" + std::to_string(sessions.size()) +
-                  " encrypted=1 roundTrip=ok");
-}
-
-std::vector<NativeCredentials> LoadNativeCredentialEntries()
-{
-    const std::string stored = ReadTextFile(GetNativeCredentialsPath());
-    if (stored.empty())
-        return {};
-    try
-    {
-        JsonPtr root = LoadJson(DecryptTokenVault(stored));
-        json_t* entries = json_object_get(root.get(), "entries");
-        if (!json_is_array(entries))
-            return {};
-        std::vector<NativeCredentials> result;
-        size_t index = 0;
-        json_t* item = nullptr;
-        json_array_foreach(entries, index, item)
-        {
-            NativeCredentials credentials;
-            credentials.provider_id = GetString(item, "provider_id");
-            credentials.email = GetString(item, "email");
-            credentials.password = GetString(item, "password");
-            if (!credentials.provider_id.empty() && !credentials.email.empty() &&
-                !credentials.password.empty())
-            {
-                result.push_back(std::move(credentials));
-            }
-        }
-        return result;
-    }
-    catch (const std::exception& e)
-    {
-        AppendAuthLog(std::string("auth-native: credential vault load failed error=") + e.what());
-        return {};
-    }
-}
-
-void SaveNativeCredentialEntries(const std::vector<NativeCredentials>& entries)
-{
-    EnsureAppHome();
-    if (entries.empty())
-    {
-        std::remove(GetNativeCredentialsPath().c_str());
-        std::remove((GetNativeCredentialsPath() + ".bak").c_str());
-        return;
-    }
-
-    JsonPtr root(json_object(), &json_decref);
-    JsonPtr values(json_array(), &json_decref);
-    for (const NativeCredentials& credentials : entries)
-    {
-        JsonPtr item(json_object(), &json_decref);
-        json_object_set_new(item.get(), "provider_id", json_string(credentials.provider_id.c_str()));
-        json_object_set_new(item.get(), "email", json_string(credentials.email.c_str()));
-        json_object_set_new(item.get(), "password", json_string(credentials.password.c_str()));
-        json_array_append_new(values.get(), json_incref(item.get()));
-    }
-    json_object_set_new(root.get(), "schema_version", json_integer(1));
-    json_object_set_new(root.get(), "entries", json_incref(values.get()));
-    char* dump = json_dumps(root.get(), JSON_COMPACT | JSON_SORT_KEYS);
-    if (!dump)
-        throw std::runtime_error("Failed to serialize the credential vault");
-    std::unique_ptr<char, decltype(&std::free)> plaintext(dump, &std::free);
-    const std::string encrypted = EncryptTokenVault(plaintext.get());
-    if (DecryptTokenVault(encrypted) != plaintext.get())
-        throw std::runtime_error("Credential vault round-trip verification failed");
-    WriteTextFileAtomically(GetNativeCredentialsPath(), encrypted);
-    AppendAuthLog("auth-native: credential vault saved entries=" + std::to_string(entries.size()));
-}
-
-bool LoadLegacySession(AuthSession& session)
-{
-    for (const std::string& path : {GetSessionPath(), GetSessionPath() + ".bak"})
-    {
-        const std::string body = ReadTextFile(path);
-        if (body.empty())
-            continue;
-        try
-        {
-            JsonPtr root = LoadJson(body);
-            if (ParseSessionObject(root.get(), session))
-                return true;
-        }
-        catch (...) {}
-    }
-
-    return false;
-}
-
-std::vector<GameInfo> GfnClient::FetchLibraryGames(AuthSession& session) const
-{
-    session = RecoverSavedSession(session);
-    std::string jwt_token = ResolveSessionJwt(session);
-    const std::string vpc_id    = ResolveVpcId(http_client_, session);
-
-    HttpResponse response = http_client_.Get(
-        BuildLibraryUrl(vpc_id, true),
-        kUserAgent,
-        BuildGraphQlHeaders(jwt_token));
-
-    if (response.status_code == 401)
-    {
-        session = RecoverSavedSession(session, true);
-        jwt_token = ResolveSessionJwt(session);
-        response = http_client_.Get(
-            BuildLibraryUrl(vpc_id, true),
-            kUserAgent,
-            BuildGraphQlHeaders(jwt_token));
-    }
-
-    if (response.status_code != 200)
-    {
-        response = http_client_.Get(
-            BuildLibraryUrl(vpc_id, false),
-            kUserAgent,
-            BuildGraphQlHeaders(jwt_token));
-    }
-
-    if (response.status_code != 200)
-    {
-        throw std::runtime_error(
-            "Library fetch failed with HTTP " + std::to_string(response.status_code));
-    }
-
-    JsonPtr root = LoadJson(response.body);
-    std::vector<GameInfo> games = ParseLibraryGames(root);
-    ApplyPlayHistory(games, LoadPlayHistory());
-    return games;
-}
-
-bool GfnClient::LoadSavedSession(AuthSession& session) const
-{
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    std::string active_user_id;
-    std::vector<AuthSession> sessions = LoadAccountsFromDisk(&active_user_id);
-    if (!sessions.empty())
-    {
-        for (const AuthSession& saved : sessions)
-        {
-            if (saved.user.user_id == active_user_id)
-            {
-                session = saved;
-                AppendAuthLog("auth: selected saved account " + AuthSessionHealth(session));
-                return true;
-            }
-        }
-
-        session = sessions.front();
-        SaveAccountsToDisk(sessions, session.user.user_id);
-        AppendAuthLog("auth: selected fallback account " + AuthSessionHealth(session));
-        return true;
-    }
-
-    if (LoadLegacySession(session))
-    {
-        SaveSession(session);
-        AppendAuthLog("auth: selected migrated legacy account " + AuthSessionHealth(session));
-        return true;
-    }
-
-    return false;
-}
-
-std::vector<AuthSession> GfnClient::LoadSavedSessions() const
-{
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    std::vector<AuthSession> sessions = LoadAccountsFromDisk();
-    if (!sessions.empty())
-        return sessions;
-
-    AuthSession legacy;
-    if (LoadLegacySession(legacy))
-    {
-        SaveSession(legacy);
-        sessions.push_back(std::move(legacy));
-    }
-
-    return sessions;
-}
-
-void GfnClient::SaveSession(const AuthSession& session) const
-{
-    if (!session.persistence_enabled)
-        return;
-
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    EnsureAppHome();
-
-    std::vector<AuthSession> sessions = LoadAccountsFromDisk();
-    bool replaced = false;
-    for (AuthSession& saved : sessions)
-    {
-        if (saved.user.user_id == session.user.user_id)
-        {
-            saved = session;
-            replaced = true;
-            break;
-        }
-    }
-
-    if (!replaced)
-        sessions.push_back(session);
-
-    SaveAccountsToDisk(sessions, session.user.user_id);
-}
-
-bool GfnClient::SetActiveSavedSession(const std::string& user_id) const
-{
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    std::vector<AuthSession> sessions = LoadAccountsFromDisk();
-    for (const AuthSession& session : sessions)
-    {
-        if (session.user.user_id == user_id)
-        {
-            SaveAccountsToDisk(sessions, session.user.user_id);
-            return true;
-        }
-    }
-
-    return false;
-}
-
-void GfnClient::ClearSavedSession() const
-{
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    AuthSession active;
-    if (!LoadSavedSession(active))
-    {
-        std::remove(GetSessionPath().c_str());
-        std::remove((GetSessionPath() + ".bak").c_str());
-        return;
-    }
-
-    std::vector<AuthSession> sessions = LoadAccountsFromDisk();
-    sessions.erase(
-        std::remove_if(
-            sessions.begin(),
-            sessions.end(),
-            [&active](const AuthSession& session) {
-                return session.user.user_id == active.user.user_id;
-            }),
-        sessions.end());
-
-    if (sessions.empty())
-    {
-        std::remove(GetAccountsPath().c_str());
-        std::remove((GetAccountsPath() + ".bak").c_str());
-        std::remove(GetSessionPath().c_str());
-        std::remove((GetSessionPath() + ".bak").c_str());
-        return;
-    }
-
-    SaveAccountsToDisk(sessions, sessions.front().user.user_id);
-}
-
-void GfnClient::ClearAllSavedSessions() const
-{
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    std::remove(GetAccountsPath().c_str());
-    std::remove((GetAccountsPath() + ".bak").c_str());
-    std::remove(GetSessionPath().c_str());
-    std::remove((GetSessionPath() + ".bak").c_str());
-}
-
-std::optional<NativeCredentials> GfnClient::LoadNativeCredentials(
-    const std::string& provider_id) const
-{
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    for (NativeCredentials& credentials : LoadNativeCredentialEntries())
-    {
-        if (credentials.provider_id == provider_id)
-            return credentials;
-    }
-    return std::nullopt;
-}
-
-void GfnClient::SaveNativeCredentials(const NativeCredentials& credentials) const
-{
-    if (credentials.provider_id.empty() || credentials.email.empty() || credentials.password.empty())
-        throw std::runtime_error("Cannot save incomplete NVIDIA credentials");
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    std::vector<NativeCredentials> entries = LoadNativeCredentialEntries();
-    bool replaced = false;
-    for (NativeCredentials& saved : entries)
-    {
-        if (saved.provider_id == credentials.provider_id)
-        {
-            saved = credentials;
-            replaced = true;
-            break;
-        }
-    }
-    if (!replaced)
-        entries.push_back(credentials);
-    SaveNativeCredentialEntries(entries);
-}
-
-void GfnClient::ClearNativeCredentials(const std::string& provider_id) const
-{
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    std::vector<NativeCredentials> entries = LoadNativeCredentialEntries();
-    entries.erase(
-        std::remove_if(entries.begin(), entries.end(), [&](const NativeCredentials& entry) {
-            return entry.provider_id == provider_id;
-        }),
-        entries.end());
-    SaveNativeCredentialEntries(entries);
-    AppendAuthLog("auth-native: saved password removed");
-}
-
-void GfnClient::ClearAllNativeCredentials() const
-{
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    SaveNativeCredentialEntries({});
-    AppendAuthLog("auth-native: all saved passwords removed");
-}
-
-std::string GfnClient::LoadLauncherPreference(
-    const std::string& user_id, const std::string& game_id) const
-{
-    if (user_id.empty() || game_id.empty())
-        return "";
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    try {
-        const std::string stored = ReadTextFile(GetLauncherPreferencesPath());
-        if (stored.empty())
-            return "";
-        JsonPtr root = LoadJson(stored);
-        return GetString(root.get(), (user_id + ":" + game_id).c_str());
-    } catch (const std::exception& e) {
-        AppendAuthLog("launcher: preference load failed error=" + std::string(e.what()));
-        return "";
-    }
-}
-
-void GfnClient::SaveLauncherPreference(
-    const std::string& user_id, const std::string& game_id,
-    const std::string& variant_id) const
-{
-    if (user_id.empty() || game_id.empty() || variant_id.empty())
-        return;
-    std::lock_guard<std::recursive_mutex> lock(g_accounts_mutex);
-    try {
-        JsonPtr root(json_object(), &json_decref);
-        const std::string stored = ReadTextFile(GetLauncherPreferencesPath());
-        if (!stored.empty()) {
-            try {
-                JsonPtr loaded = LoadJson(stored);
-                if (json_is_object(loaded.get()))
-                    root = std::move(loaded);
-            } catch (...) {
-            }
-        }
-        json_object_set_new(root.get(), (user_id + ":" + game_id).c_str(),
-                            json_string(variant_id.c_str()));
-        WriteJsonToFile(GetLauncherPreferencesPath(), root.get());
-        AppendAuthLog("launcher: preference saved game=" + game_id + " variant=" + variant_id);
-    } catch (const std::exception& e) {
-        AppendAuthLog("launcher: preference save failed error=" + std::string(e.what()));
-    }
-}
-
-[[maybe_unused]] static std::string GenerateUUID()
-{
-    auto bytes = GenerateRandomBytes(16);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    std::string hex = HexEncode(bytes.data(), 16);
-    return hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) + "-" + hex.substr(16, 4) + "-" + hex.substr(20);
-}
-
-static std::string BuildSessionBody(
-    const std::string& app_id,
-    const std::string& internal_title,
-    const std::string& device_id,
-    const StreamSettings& stream_settings)
-{
-    json_t* root = json_object();
-    json_t* req = json_object();
-    try {
-        json_object_set_new(req, "appId", json_integer(std::stoll(app_id)));
-    } catch (...) {
-        json_object_set_new(req, "appId", json_integer(0));
-    }
-    json_object_set_new(req, "cmsId", json_string(app_id.c_str()));
-    if (internal_title.empty())
-        json_object_set_new(req, "internalTitle", json_null());
-    else
-        json_object_set_new(req, "internalTitle", json_string(internal_title.c_str()));
-    json_object_set_new(req, "networkTestSessionId", json_null());
-    json_object_set_new(req, "parentSessionId", json_null());
-    json_object_set_new(req, "clientIdentification", json_string("GFN-PC"));
-    json_object_set_new(req, "deviceHashId", json_string(device_id.c_str()));
-    json_object_set_new(req, "clientVersion", json_string("30.0"));
-    json_object_set_new(req, "clientPlatformName", json_string("windows"));
-
-    json_object_set_new(req, "availableSupportedControllers", json_array());
-    json_object_set_new(req, "sdkVersion", json_string("1.0"));
-    json_object_set_new(req, "streamerVersion", json_integer(1));
-    json_object_set_new(req, "useOps", json_true());
-    json_object_set_new(req, "audioMode", json_integer(2));
-    json_object_set_new(req, "sdrHdrMode", json_integer(0));
-    json_object_set_new(req, "clientDisplayHdrCapabilities", json_null());
-    json_object_set_new(req, "surroundAudioInfo", json_integer(0));
-    // Reserve player 1 for the virtual XInput controller exposed by the
-    // Switch stream view. The gamepad reports use the same active bitmap.
-    json_object_set_new(req, "remoteControllersBitmap", json_integer(1));
-    json_object_set_new(req, "enhancedStreamMode", json_integer(1));
-    json_object_set_new(req, "appLaunchMode", json_integer(1));
-    json_object_set_new(req, "secureRTSPSupported", json_false());
-    json_object_set_new(req, "partnerCustomData", json_string(""));
-    json_object_set_new(req, "accountLinked", json_true());
-    json_object_set_new(
-        req, "enablePersistingInGameSettings",
-        json_boolean(stream_settings.persist_game_settings));
-    json_object_set_new(req, "userAge", json_integer(26));
-    json_object_set_new(req, "clientTimezoneOffset", json_integer(0));
-    
-    json_t* features = json_object();
-    json_object_set_new(features, "reflex", json_false());
-    // CloudMatch uses an enum here: 0 = 8-bit SDR, 10 = 10-bit capable.
-    // Sending literal 8 makes the whole launch request fail with a generic
-    // INTERNAL_ERROR_STATUS before the session can enter queue/setup.
-    json_object_set_new(features, "bitDepth", json_integer(0));
-    json_object_set_new(features, "cloudGsync", json_false());
-    json_object_set_new(features, "enabledL4S", json_false());
-    json_object_set_new(features, "mouseMovementFlags", json_integer(0));
-    json_object_set_new(features, "trueHdr", json_false());
-    json_object_set_new(features, "supportedHidDevices", json_integer(0));
-    json_object_set_new(features, "profile", json_integer(0));
-    json_object_set_new(features, "fallbackToLogicalResolution", json_false());
-    json_object_set_new(features, "hidDevices", json_null());
-    json_object_set_new(features, "chromaFormat", json_integer(0));
-    json_object_set_new(features, "prefilterMode", json_integer(0));
-    json_object_set_new(features, "prefilterSharpness", json_integer(0));
-    json_object_set_new(features, "prefilterNoiseReduction", json_integer(0));
-    json_object_set_new(features, "hudStreamingMode", json_integer(0));
-    json_object_set_new(features, "sdrColorSpace", json_integer(2));
-    json_object_set_new(features, "hdrColorSpace", json_integer(0));
-    json_object_set_new(req, "requestedStreamingFeatures", features);
-
-    json_t* meta = json_array();
-    json_t* m1 = json_object(); json_object_set_new(m1, "key", json_string("SubSessionId")); json_object_set_new(m1, "value", json_string(device_id.c_str())); json_array_append_new(meta, m1);
-    json_t* m2 = json_object(); json_object_set_new(m2, "key", json_string("wssignaling")); json_object_set_new(m2, "value", json_string("1")); json_array_append_new(meta, m2);
-    json_t* m3 = json_object(); json_object_set_new(m3, "key", json_string("GSStreamerType")); json_object_set_new(m3, "value", json_string("WebRTC")); json_array_append_new(meta, m3);
-    json_object_set_new(req, "metaData", meta);
-
-    json_t* monitors = json_array();
-    json_t* monitor = json_object();
-    json_object_set_new(monitor, "monitorId", json_integer(0));
-    json_object_set_new(monitor, "positionX", json_integer(0));
-    json_object_set_new(monitor, "positionY", json_integer(0));
-    json_object_set_new(monitor, "widthInPixels", json_integer(stream_settings.width));
-    json_object_set_new(monitor, "heightInPixels", json_integer(stream_settings.height));
-    json_object_set_new(monitor, "framesPerSecond", json_integer(stream_settings.fps));
-    json_object_set_new(monitor, "sdrHdrMode", json_integer(0));
-    json_object_set_new(monitor, "displayData", json_null());
-    json_object_set_new(monitor, "hdr10PlusGamingData", json_null());
-    json_object_set_new(monitor, "dpi", json_integer(100));
-    json_array_append_new(monitors, monitor);
-    json_object_set_new(req, "clientRequestMonitorSettings", monitors);
-
-    json_object_set_new(root, "sessionRequestData", req);
-
-    char* dump = json_dumps(root, 0);
-    std::string body(dump);
-    free(dump);
-    json_decref(root);
-    return body;
-}
-
-int ParseSessionStatus(json_t* status)
-{
-    if (json_is_integer(status))
-        return static_cast<int>(json_integer_value(status));
-
-    if (!json_is_string(status))
-        return -1;
-
-    const std::string value = Lowercase(JsonString(status));
-    if (value == "queued")
-        return 0;
-
-    if (value == "provisioning" || value == "initializing" || value == "setup" ||
-        value == "setting_up" || value == "launching" || value == "launching_game")
-        return 1;
-
-    if (value == "active" || value == "ready" || value == "paused")
-        return 2;
-
-    if (value == "streaming" || value == "playing" || value == "connected")
-        return 3;
-
-    if (value.find("ad") != std::string::npos)
-        return 6;
-
-    if (value.find("fail") != std::string::npos || value.find("error") != std::string::npos ||
-        value.find("closed") != std::string::npos || value.find("terminated") != std::string::npos ||
-        value.find("cancel") != std::string::npos)
-        return 4;
-
-    return -1;
-}
-
-std::string SessionInfoTraceSummary(const SessionInfo& info)
-{
-    std::ostringstream out;
-    out << "sessionId=" << info.session_id
-        << " status=" << info.status
-        << " queuePosition=" << info.queue_position
-        << " appPatching=" << (info.app_patching ? 1 : 0)
-        << " serverIp=" << info.server_ip
-        << " signalingUrl=" << info.signaling_url
-        << " media=" << info.media_ip << ":" << info.media_port
-        << " iceServers=" << info.ice_servers.size()
-        << " sessionToken=" << (info.session_token.empty() ? "missing" : "present");
-    return out.str();
-}
-
-SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& launch_app_id,
-                                    const std::string& launch_store,
-                                    const std::string& internal_title) const
-{
-    session = EnsureFreshSavedSession(session);
-    std::string jwt_token = ResolveSessionJwt(session);
-    const std::string device_id = device_id_;
-
-    const StreamSettings stream_settings = LoadStreamSettings();
-    std::string url = session.provider.streaming_service_url +
-        "v2/session?keyboardLayout=en-US_qwerty&languageCode=" +
-        stream_settings.game_language;
-
-    std::vector<std::string> headers = {
-        "Authorization: GFNJWT " + jwt_token,
-        "Content-Type: application/json",
-        "nv-client-id: " + client_id_,
-        "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
-        "nv-device-make: UNKNOWN",
-        "nv-device-model: UNKNOWN",
-        "nv-device-os: WINDOWS",
-        "nv-device-type: DESKTOP",
-        "x-device-id: " + device_id,
-        "Origin: https://play.geforcenow.com",
-        "Referer: https://play.geforcenow.com/"
-    };
-
-    std::string body = BuildSessionBody(launch_app_id, internal_title, device_id, stream_settings);
-    ResetSessionTraceLog("StartSession appId=" + launch_app_id +
-                         " store=" + (launch_store.empty() ? "unknown" : launch_store) +
-                         " internalTitle=" + (internal_title.empty() ? "missing" : internal_title));
-    CleanupStaleCloudSession(session);
-    jwt_token = ResolveSessionJwt(session);
-    headers[0] = "Authorization: GFNJWT " + jwt_token;
-    AppendSessionTraceLog("START url=" + url);
-    AppendSessionTraceLog(
-        "START settings=" + std::to_string(stream_settings.width) + "x" +
-        std::to_string(stream_settings.height) + "@" + std::to_string(stream_settings.fps) +
-        " bitrate=" + std::to_string(stream_settings.bitrate_kbps) +
-        "kbps language=" + stream_settings.game_language +
-        " persistGameSettings=" +
-        std::to_string(stream_settings.persist_game_settings ? 1 : 0) +
-        " deviceId=" + device_id);
-    AppendSessionTraceLog("START headers:\n" + HeadersForTrace(headers));
-    AppendSessionTraceLog("START request body:\n" + JsonForTrace(body));
-
-    HttpResponse response = http_client_.Post(url, kUserAgent, headers, body);
-    if (response.status_code == 401)
-    {
-        session = ForceRefreshSavedSession(session);
-        jwt_token = ResolveSessionJwt(session);
-        headers[0] = "Authorization: GFNJWT " + jwt_token;
-        AppendSessionTraceLog("START authorization rejected; refreshed token and retrying once");
-        response = http_client_.Post(url, kUserAgent, headers, body);
-    }
-    AppendSessionTraceLog("START response HTTP " + std::to_string(response.status_code));
-    AppendSessionTraceLog("START response body:\n" + JsonForTrace(response.body));
-
-    auto parse_start_response = [&response]() -> JsonPtr {
-        try {
-            return LoadJson(response.body);
-        } catch (const std::exception& e) {
-            AppendSessionTraceLog(std::string("START JSON parse error: ") + e.what());
-            return JsonPtr(nullptr, &json_decref);
-        }
-    };
-    JsonPtr root = parse_start_response();
-
-    if (root && IsDeviceSessionLimitResponse(root.get()))
-    {
-        AppendSessionTraceLog(
-            "START device session limit detected; refreshing the server session list, "
-            "cleaning matching sessions and retrying once");
-        CleanupStaleCloudSession(session);
-        jwt_token = ResolveSessionJwt(session);
-        headers[0] = "Authorization: GFNJWT " + jwt_token;
-        response = http_client_.Post(url, kUserAgent, headers, body);
-        AppendSessionTraceLog("START retry response HTTP " + std::to_string(response.status_code));
-        AppendSessionTraceLog("START retry response body:\n" + JsonForTrace(response.body));
-        root = parse_start_response();
-    }
-
-    const bool app_patching = root && IsAppPatchingResponse(root.get());
-    if (root)
-    {
-        json_t* req_status = json_object_get(root.get(), "requestStatus");
-        if (req_status && GetInteger(req_status, "statusCode") != 1 && !app_patching)
-        {
-            const std::string error = BuildCloudMatchErrorMessage("StartSession", response.status_code, root.get());
-            AppendSessionTraceLog("START api error: " + error);
-            throw std::runtime_error(error);
-        }
-    }
-
-    if (response.status_code != 200 && response.status_code != 202 && !app_patching)
-    {
-        const std::string error = BuildCloudMatchErrorMessage("StartSession", response.status_code, root.get());
-        AppendSessionTraceLog("START http error: " + error);
-        throw std::runtime_error(error);
-    }
-
-    if (!root) {
-        AppendSessionTraceLog("START failed: empty or invalid JSON");
-        throw std::runtime_error("StartSession failed: Empty or invalid JSON" + SessionTraceHint());
-    }
-
-    SessionInfo info;
-    info.app_patching = app_patching;
-    CollectIceServersFromObject(root.get(), info);
-    
-    json_t* sess = json_object_get(root.get(), "session");
-    if (sess)
-    {
-        json_t* s_id = json_object_get(sess, "sessionId");
-        if (s_id && json_is_string(s_id))
-            info.session_id = json_string_value(s_id);
-            
-        json_t* status = json_object_get(sess, "status");
-        if (status)
-            info.status = ParseSessionStatus(status);
-            
-        json_t* qp = json_object_get(sess, "queuePosition");
-        if (qp && json_is_integer(qp))
-            info.queue_position = json_integer_value(qp);
-
-        ApplySeatSetupInfo(sess, info);
-
-        ApplySessionNetworkInfo(sess, info);
-    }
-    
-    // Check root for queuePosition
-    json_t* root_qp = json_object_get(root.get(), "queuePosition");
-    if (root_qp && json_is_integer(root_qp)) {
-        info.queue_position = json_integer_value(root_qp);
-    }
-
-    if (info.session_id.empty()) {
-        AppendSessionTraceLog("START failed: session ID missing after successful response");
-        throw std::runtime_error("Failed to parse session ID from response" + SessionTraceHint());
-    }
-
-    if (app_patching)
-        AppendSessionTraceLog("START pending reason=app_patching; polling created session");
-    RememberActiveCloudSession(session, info.session_id, launch_app_id);
-    AppendSessionTraceLog("START parsed: " + SessionInfoTraceSummary(info));
-    return info;
-}
-
-SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& session_id) const
-{
-    session = EnsureFreshSavedSession(session);
-    std::string jwt_token = ResolveSessionJwt(session);
-    const std::string device_id = device_id_;
-    std::string url = session.provider.streaming_service_url + "v2/session/" + session_id;
-
-    std::vector<std::string> headers = {
-        "Authorization: GFNJWT " + jwt_token,
-        "nv-client-id: " + client_id_,
-        "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
-        "nv-device-make: UNKNOWN",
-        "nv-device-model: UNKNOWN",
-        "nv-device-os: WINDOWS",
-        "nv-device-type: DESKTOP",
-        "x-device-id: " + device_id,
-        "Content-Type: application/json"
-    };
-
-    AppendSessionTraceLog("POLL url=" + url);
-    AppendSessionTraceLog("POLL headers:\n" + HeadersForTrace(headers));
-    HttpResponse response = http_client_.Get(url, kUserAgent, headers);
-    if (response.status_code == 401)
-    {
-        session = ForceRefreshSavedSession(session);
-        jwt_token = ResolveSessionJwt(session);
-        headers[0] = "Authorization: GFNJWT " + jwt_token;
-        AppendSessionTraceLog("POLL authorization rejected; refreshed token and retrying once");
-        response = http_client_.Get(url, kUserAgent, headers);
-    }
-    AppendSessionTraceLog("POLL response HTTP " + std::to_string(response.status_code));
-    AppendSessionTraceLog("POLL response body:\n" + JsonForTrace(response.body));
-
-    JsonPtr root(nullptr, &json_decref);
-    try {
-        root = LoadJson(response.body);
-    } catch (const std::exception& e) {
-        AppendSessionTraceLog(std::string("POLL JSON parse error: ") + e.what());
-    }
-
-    const bool app_patching = root && IsAppPatchingResponse(root.get());
-    if (root)
-    {
-        json_t* req_status = json_object_get(root.get(), "requestStatus");
-        if (req_status && GetInteger(req_status, "statusCode") != 1 && !app_patching)
-        {
-            const std::string error = BuildCloudMatchErrorMessage("PollSession", response.status_code, root.get());
-            AppendSessionTraceLog("POLL api error: " + error);
-            throw std::runtime_error(error);
-        }
-    }
-
-    if (response.status_code != 200 && !app_patching)
-    {
-        const std::string error = BuildCloudMatchErrorMessage("PollSession", response.status_code, root.get());
-        AppendSessionTraceLog("POLL http error: " + error);
-        throw std::runtime_error(error);
-    }
-
-    if (!root) {
-        AppendSessionTraceLog("POLL failed: empty or invalid JSON");
-        throw std::runtime_error("PollSession failed: Empty or invalid JSON" + SessionTraceHint());
-    }
-
-    // Keep diagnostics useful without persisting session tokens returned by CloudMatch.
-    const std::string redacted_session = JsonForTrace(response.body);
-    FILE* session_dump = fopen("sdmc:/switch/SwitchNOW/switchnow_session.json", "w");
-    if (session_dump) {
-        fputs(redacted_session.c_str(), session_dump);
-        fclose(session_dump);
-    }
-
-    SessionInfo info;
-    info.session_id = session_id;
-    info.app_patching = app_patching;
-    CollectIceServersFromObject(root.get(), info);
-    
-    json_t* sess = json_object_get(root.get(), "session");
-    if (sess)
-    {
-        json_t* status = json_object_get(sess, "status");
-        if (status)
-            info.status = ParseSessionStatus(status);
-            
-        json_t* qp = json_object_get(sess, "queuePosition");
-        if (qp && json_is_integer(qp))
-            info.queue_position = json_integer_value(qp);
-
-        ApplySeatSetupInfo(sess, info);
-            
-        ApplySessionNetworkInfo(sess, info);
-    }
-    
-    // Sometimes queuePosition is at the root level!
-    json_t* root_qp = json_object_get(root.get(), "queuePosition");
-    if (root_qp && json_is_integer(root_qp)) {
-        info.queue_position = json_integer_value(root_qp);
-    }
-
-    if (app_patching)
-        AppendSessionTraceLog("POLL pending reason=app_patching");
-    AppendSessionTraceLog("POLL parsed: " + SessionInfoTraceSummary(info));
-    return info;
-}
-
-void GfnClient::StopSession(
-    AuthSession& session,
-    const std::string& session_id,
-    const std::string& server_ip) const
-{
-    session = EnsureFreshSavedSession(session);
-    std::string jwt_token = ResolveSessionJwt(session);
-    const std::string device_id = device_id_;
-    std::string base_url = session.provider.streaming_service_url;
-    if (!server_ip.empty())
-    {
-        base_url = HasPrefix(server_ip, "https://") || HasPrefix(server_ip, "http://")
-            ? server_ip
-            : "https://" + server_ip;
-        base_url = EnsureTrailingSlash(base_url);
-    }
-    std::string url = base_url + "v2/session/" + session_id;
-
-    std::vector<std::string> headers = {
-        "Authorization: GFNJWT " + jwt_token,
-        "nv-client-id: " + client_id_,
-        "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
-        "nv-device-make: UNKNOWN",
-        "nv-device-model: UNKNOWN",
-        "nv-device-os: WINDOWS",
-        "nv-device-type: DESKTOP",
-        "x-device-id: " + device_id,
-        "Content-Type: application/json"
-    };
-
-    AppendSessionTraceLog("STOP url=" + url);
-    AppendSessionTraceLog("STOP headers:\n" + HeadersForTrace(headers));
-    HttpResponse response = http_client_.Request("DELETE", url, kUserAgent, headers);
-    if (response.status_code == 401)
-    {
-        session = ForceRefreshSavedSession(session);
-        jwt_token = ResolveSessionJwt(session);
-        headers[0] = "Authorization: GFNJWT " + jwt_token;
-        AppendSessionTraceLog("STOP authorization rejected; refreshed token and retrying once");
-        response = http_client_.Request("DELETE", url, kUserAgent, headers);
-    }
-    AppendSessionTraceLog("STOP response HTTP " + std::to_string(response.status_code));
-    AppendSessionTraceLog("STOP response body:\n" + JsonForTrace(response.body));
-    if ((response.status_code >= 200 && response.status_code < 300) || response.status_code == 404)
-    {
-        ForgetActiveCloudSession(session_id);
-        return;
-    }
-
-    throw std::runtime_error("StopSession failed with HTTP " + std::to_string(response.status_code));
-}
-
-void GfnClient::CleanupStaleCloudSession(AuthSession& session) const
-{
-    const std::string stale_session_id = LoadActiveCloudSessionId(session);
-    session = EnsureFreshSavedSession(session);
-    std::string jwt_token = ResolveSessionJwt(session);
-    const std::string list_url = session.provider.streaming_service_url + "v2/session";
-    std::vector<std::string> headers = {
-        "Authorization: GFNJWT " + jwt_token,
-        "nv-client-id: " + client_id_,
-        "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
-        "nv-device-make: UNKNOWN",
-        "nv-device-model: UNKNOWN",
-        "nv-device-os: WINDOWS",
-        "nv-device-type: DESKTOP",
-        "x-device-id: " + device_id_,
-        "Content-Type: application/json"
-    };
-
-    AppendSessionTraceLog("CLEANUP list url=" + list_url);
-    HttpResponse response = http_client_.Get(list_url, kUserAgent, headers);
-    if (response.status_code == 401)
-    {
-        session = ForceRefreshSavedSession(session);
-        jwt_token = ResolveSessionJwt(session);
-        headers[0] = "Authorization: GFNJWT " + jwt_token;
-        AppendSessionTraceLog(
-            "CLEANUP authorization rejected; refreshed token and retrying session list once");
-        response = http_client_.Get(list_url, kUserAgent, headers);
-    }
-    AppendSessionTraceLog("CLEANUP list response HTTP " + std::to_string(response.status_code));
-    AppendSessionTraceLog("CLEANUP list response body:\n" + JsonForTrace(response.body));
-
-    bool usable_list = false;
-    bool tracked_session_seen = false;
-    std::string cleanup_error;
-    if (response.status_code >= 200 && response.status_code < 300)
-    {
-        try
-        {
-            JsonPtr root = LoadJson(response.body);
-            json_t* request_status = json_object_get(root.get(), "requestStatus");
-            json_t* sessions = json_object_get(root.get(), "sessions");
-            usable_list =
-                request_status &&
-                GetInteger(request_status, "statusCode") == 1 &&
-                json_is_array(sessions);
-
-            if (usable_list)
-            {
-                size_t index = 0;
-                json_t* cloud_session = nullptr;
-                json_array_foreach(sessions, index, cloud_session)
-                {
-                    const std::string session_id = GetString(cloud_session, "sessionId");
-                    const int status = ParseSessionStatus(
-                        json_object_get(cloud_session, "status"));
-                    const std::string session_device_id = GetString(
-                        json_object_get(cloud_session, "sessionRequestData"),
-                        "deviceHashId");
-                    if (session_id == stale_session_id)
-                        tracked_session_seen = true;
-
-                    if (!cloud_session::ShouldCleanup(
-                            status,
-                            session_id,
-                            session_device_id,
-                            device_id_,
-                            stale_session_id))
-                    {
-                        continue;
-                    }
-
-                    const std::string server_ip = GetSessionServerIp(cloud_session);
-                    AppendSessionTraceLog(
-                        "CLEANUP stopping session id=" + session_id +
-                        " status=" + std::to_string(status) +
-                        " source=" +
-                        (session_id == stale_session_id ? "local_record" : "matching_device") +
-                        " server=" + (server_ip.empty() ? "provider" : server_ip));
-                    try
-                    {
-                        StopSession(session, session_id, server_ip);
-                    }
-                    catch (const std::exception& e)
-                    {
-                        cleanup_error = e.what();
-                        AppendSessionTraceLog(
-                            "CLEANUP stop failed id=" + session_id +
-                            " error=" + cleanup_error);
-                    }
-                }
-            }
-        }
-        catch (const std::exception& e)
-        {
-            AppendSessionTraceLog(
-                "CLEANUP list parse failed error=" + std::string(e.what()));
-        }
-    }
-
-    if (usable_list)
-    {
-        if (!stale_session_id.empty() && !tracked_session_seen)
-            ForgetActiveCloudSession(stale_session_id);
-        if (!cleanup_error.empty())
-            throw std::runtime_error(cleanup_error);
-        return;
-    }
-
-    // Older or temporarily unavailable list endpoints still get the original
-    // local-record cleanup path.
-    if (!stale_session_id.empty())
-    {
-        AppendSessionTraceLog(
-            "CLEANUP session list unavailable; falling back to locally tracked session");
-        StopSession(session, stale_session_id);
-    }
-}
+#include "gfn/catalog.inc"
+#include "gfn/auth.inc"
+#include "gfn/library.inc"
+#include "gfn/session.inc"
 
 } // namespace opennow

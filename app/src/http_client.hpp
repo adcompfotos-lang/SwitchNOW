@@ -20,18 +20,26 @@ class HttpClient
         const std::string& url,
         const std::string& user_agent,
         const std::vector<std::string>& headers = {},
-        const std::string& body = {}) const;
+        const std::string& body = {},
+        long connect_timeout_seconds = 10,
+        long timeout_seconds = 30) const;
 
     HttpResponse Get(
         const std::string& url,
         const std::string& user_agent,
-        const std::vector<std::string>& headers = {}) const;
+        const std::vector<std::string>& headers = {},
+        long connect_timeout_seconds = 10,
+        long timeout_seconds = 30) const;
 
     HttpResponse Post(
         const std::string& url,
         const std::string& user_agent,
         const std::vector<std::string>& headers,
         const std::string& body) const;
+
+    int MeasureConnectLatencyMs(
+        const std::string& url,
+        long timeout_ms = 3000) const noexcept;
 };
 
 } // namespace opennow

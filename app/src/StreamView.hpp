@@ -60,6 +60,10 @@ private:
     void UpdateInlineKeyboard();
     void HandleKeyboardText(const char* text);
     void SendKeyboardCharacter(char character);
+    void SendEscapeKey(const char* source);
+    void UpdateRemoteEscapeKey(std::chrono::steady_clock::time_point now);
+    void DrawKeyboardControls(
+        NVGcontext* vg, float x, float y, float width);
     void StartNteAutoLogin(std::chrono::steady_clock::time_point now);
     void CancelNteAutoLogin();
     void UpdateNteAutoLogin(std::chrono::steady_clock::time_point now);
@@ -125,14 +129,20 @@ private:
     float touch_pointer_y_ = 0.0f;
     int touch_pointer_stream_width_ = 0;
     int touch_pointer_stream_height_ = 0;
-    bool keyboard_combo_was_down_ = false;
+    bool keyboard_combo_armed_ = true;
     bool keyboard_b_was_down_ = false;
     bool keyboard_plus_was_down_ = false;
+    bool keyboard_escape_was_down_ = false;
+    bool keyboard_usb_escape_was_down_ = false;
+    bool remote_escape_down_ = false;
+    std::chrono::steady_clock::time_point remote_escape_release_at_ {};
     bool suppress_b_until_release_ = false;
     bool keyboard_release_guard_ = false;
     bool keyboard_visible_ = false;
     bool keyboard_launched_ = false;
+    unsigned int keyboard_update_failures_ = 0;
     std::string keyboard_text_;
+    std::chrono::steady_clock::time_point last_keyboard_open_attempt_ {};
 #ifdef __SWITCH__
     SwkbdInline inline_keyboard_ {};
 #endif

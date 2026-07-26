@@ -1,5 +1,6 @@
 #include "ui_action_guard.hpp"
 
+#include "runtime_journal.hpp"
 #include "ui_helpers.hpp"
 #include "stream_diagnostics.hpp"
 
@@ -50,17 +51,24 @@ void LogUiAction(const std::string& action, const std::string& phase,
 
 bool RunUiAction(const std::string& action, const std::function<void()>& callback)
 {
+    const std::uint64_t operation_id =
+        BeginRuntimeOperation("ui", action);
     LogUiAction(action, "begin");
     try
     {
         callback();
         LogUiAction(action, "ok");
+        EndRuntimeOperation(operation_id, "ui", action, "ok");
         return true;
     }
     catch (const std::exception& exception)
     {
         LogUiAction(action, "error", exception.what());
-        std::string detail = action + ": " + exception.what();
+        EndRuntimeOperation(
+            operation_id, "ui", action, "error", exception.what());
+        std::string detail =
+            action + ": " + exception.what() +
+            "\n\nRuntime: sdmc:/switch/SwitchNOW/runtime.log";
         if (StreamDiagnosticsEnabled())
             detail += "\n\nDetails: sdmc:/switch/SwitchNOW/ui.log";
         ShowError("Interface Action Failed", detail);
@@ -68,7 +76,11 @@ bool RunUiAction(const std::string& action, const std::function<void()>& callbac
     catch (...)
     {
         LogUiAction(action, "error", "unknown exception");
-        std::string detail = action + ": unknown error";
+        EndRuntimeOperation(
+            operation_id, "ui", action, "error", "unknown_exception");
+        std::string detail =
+            action + ": unknown error"
+            "\n\nRuntime: sdmc:/switch/SwitchNOW/runtime.log";
         if (StreamDiagnosticsEnabled())
             detail += "\n\nDetails: sdmc:/switch/SwitchNOW/ui.log";
         ShowError("Interface Action Failed", detail);

@@ -3,6 +3,7 @@
 #include "input/TouchMapping.hpp"
 #include "network_utils.hpp"
 #include "nte_autologin_log.hpp"
+#include "runtime_journal.hpp"
 #include "stream/ffmpeg/AVFrameHolder.hpp"
 #include "stream_diagnostics.hpp"
 #include "stream_settings.hpp"
@@ -184,6 +185,10 @@ StreamView::~StreamView() {
         keyboard_launched_ = false;
     }
 #endif
+    if (session_ && remote_escape_down_) {
+        session_->send_keyboard_key(0x1b, 0x01, 0, false);
+        remote_escape_down_ = false;
+    }
     brls::Application::getPlatform()->disableScreenDimming(false);
     brls::Application::getPlatform()->getInputManager()->setPointerLock(false);
     StopCloudSessionAsync();
@@ -209,6 +214,32 @@ void StreamView::SendKeyboardCharacter(char character) {
 
     session_->send_keyboard_key(stroke.keycode, stroke.scancode, stroke.modifiers, true);
     session_->send_keyboard_key(stroke.keycode, stroke.scancode, stroke.modifiers, false);
+}
+
+void StreamView::SendEscapeKey(const char* source) {
+    if (!session_)
+        return;
+    if (remote_escape_down_)
+        session_->send_keyboard_key(0x1b, 0x01, 0, false);
+    session_->send_keyboard_key(0x1b, 0x01, 0, true);
+    remote_escape_down_ = true;
+    remote_escape_release_at_ =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(85);
+    session_->record_ui_event(
+        "keyboard remote_escape source=" +
+        std::string(source ? source : "unknown"));
+    opennow::LogRuntimeEvent(
+        "keyboard", "escape",
+        "source=" + std::string(source ? source : "unknown"));
+}
+
+void StreamView::UpdateRemoteEscapeKey(
+    std::chrono::steady_clock::time_point now) {
+    if (!session_ || !remote_escape_down_ || now < remote_escape_release_at_)
+        return;
+    session_->send_keyboard_key(0x1b, 0x01, 0, false);
+    remote_escape_down_ = false;
+    session_->record_ui_event("keyboard remote_escape released");
 }
 
 void StreamView::SendNteClick(float normalized_x, float normalized_y) {
@@ -444,9 +475,30 @@ void StreamView::OpenInlineKeyboard() {
     if (keyboard_visible_)
         return;
 
+    const auto now = std::chrono::steady_clock::now();
+    if (last_keyboard_open_attempt_.time_since_epoch().count() != 0 &&
+        now - last_keyboard_open_attempt_ < std::chrono::milliseconds(350))
+    {
+        return;
+    }
+    last_keyboard_open_attempt_ = now;
+    opennow::LogRuntimeEvent("keyboard", "open_request", "combo=Minus+Y");
+
+    // A fresh inline applet prevents stale Swkbd state after repeated
+    // open/close cycles or a suspended stream.
+    if (keyboard_launched_)
+    {
+        swkbdInlineClose(&inline_keyboard_);
+        inline_keyboard_ = {};
+        keyboard_launched_ = false;
+        active_keyboard_view_ = nullptr;
+    }
+
     if (!keyboard_launched_) {
         Result rc = swkbdInlineCreate(&inline_keyboard_);
         if (R_FAILED(rc)) {
+            opennow::LogRuntimeEvent(
+                "keyboard", "create_failed", "rc=" + std::to_string(rc));
             if (session_)
                 session_->record_ui_event("keyboard create failed rc=" + std::to_string(rc));
             return;
@@ -456,6 +508,9 @@ void StreamView::OpenInlineKeyboard() {
             &inline_keyboard_, static_cast<u8>(SwkbdInlineMode_AppletDisplay), 1);
         if (R_FAILED(rc)) {
             swkbdInlineClose(&inline_keyboard_);
+            inline_keyboard_ = {};
+            opennow::LogRuntimeEvent(
+                "keyboard", "launch_failed", "rc=" + std::to_string(rc));
             if (session_)
                 session_->record_ui_event("keyboard launch failed rc=" + std::to_string(rc));
             return;
@@ -484,8 +539,11 @@ void StreamView::OpenInlineKeyboard() {
     swkbdInlineAppearArgSetOkButtonText(&appear, "Enter");
     swkbdInlineAppear(&inline_keyboard_, &appear);
     keyboard_visible_ = true;
+    keyboard_update_failures_ = 0;
     keyboard_b_was_down_ = false;
     keyboard_plus_was_down_ = false;
+    keyboard_escape_was_down_ = false;
+    keyboard_usb_escape_was_down_ = false;
     gamepad_state_initialized_ = false;
     if (touch_was_down_) {
         session_->send_mouse_left_button(false);
@@ -493,6 +551,7 @@ void StreamView::OpenInlineKeyboard() {
     }
     session_->send_gamepad_input(0, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f);
     session_->record_ui_event("keyboard opened by Minus+Y");
+    opennow::LogRuntimeEvent("keyboard", "opened", "combo=Minus+Y");
 #endif
 }
 
@@ -510,6 +569,8 @@ void StreamView::HideInlineKeyboard(bool send_enter) {
     keyboard_release_guard_ = true;
     if (session_)
         session_->record_ui_event(send_enter ? "keyboard submitted" : "keyboard hidden by B");
+    opennow::LogRuntimeEvent(
+        "keyboard", send_enter ? "submitted" : "hidden", "");
 #else
     (void)send_enter;
 #endif
@@ -519,11 +580,78 @@ void StreamView::UpdateInlineKeyboard() {
 #ifdef __SWITCH__
     if (!keyboard_launched_)
         return;
+    const bool usb_escape_down =
+        brls::Application::getPlatform()->getInputManager()->
+            getKeyboardKeyState(brls::BRLS_KBD_KEY_ESCAPE);
+    if (keyboard_visible_ && usb_escape_down &&
+        !keyboard_usb_escape_was_down_)
+    {
+        SendEscapeKey("usb");
+    }
+    keyboard_usb_escape_was_down_ = usb_escape_down;
+
     SwkbdState state = SwkbdState_Inactive;
     const Result rc = swkbdInlineUpdate(&inline_keyboard_, &state);
-    if (R_FAILED(rc) && session_)
+    if (R_SUCCEEDED(rc))
+    {
+        keyboard_update_failures_ = 0;
+        return;
+    }
+
+    ++keyboard_update_failures_;
+    if (session_)
         session_->record_ui_event("keyboard update failed rc=" + std::to_string(rc));
+    opennow::LogRuntimeEvent(
+        "keyboard", "update_failed",
+        "rc=" + std::to_string(rc) +
+        " consecutive=" + std::to_string(keyboard_update_failures_));
+    if (keyboard_update_failures_ >= 3)
+    {
+        swkbdInlineClose(&inline_keyboard_);
+        inline_keyboard_ = {};
+        keyboard_launched_ = false;
+        keyboard_visible_ = false;
+        keyboard_text_.clear();
+        keyboard_release_guard_ = true;
+        gamepad_state_initialized_ = false;
+        active_keyboard_view_ = nullptr;
+        opennow::LogRuntimeEvent("keyboard", "recovered", "reason=update_failure");
+    }
 #endif
+}
+
+void StreamView::DrawKeyboardControls(
+    NVGcontext* vg, float x, float y, float width) {
+    if (!keyboard_visible_)
+        return;
+
+    const float box_width = 500.0f;
+    const float box_height = 48.0f;
+    const float box_x = x + width - box_width - 18.0f;
+    const float box_y = y + 14.0f;
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, box_x, box_y, box_width, box_height, 10.0f);
+    nvgFillColor(vg, nvgRGBA(7, 10, 13, 224));
+    nvgFill(vg);
+    const float escape_width = 152.0f;
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, box_x + 5.0f, box_y + 5.0f,
+                   escape_width, box_height - 10.0f, 7.0f);
+    nvgFillColor(vg, nvgRGB(28, 90, 59));
+    nvgFill(vg);
+    nvgStrokeWidth(vg, 2.0f);
+    nvgStrokeColor(vg, nvgRGB(94, 235, 148));
+    nvgStroke(vg);
+    nvgFontFaceId(vg, brls::Application::getFont(brls::FONT_REGULAR));
+    nvgFontSize(vg, 17.0f);
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, nvgRGB(242, 246, 248));
+    nvgText(vg, box_x + 5.0f + escape_width * 0.5f,
+            box_y + box_height * 0.5f, "ZL  ESC", nullptr);
+    nvgText(vg, box_x + 250.0f, box_y + box_height * 0.5f,
+            "+  ENTER", nullptr);
+    nvgText(vg, box_x + 414.0f, box_y + box_height * 0.5f,
+            "B  CLOSE", nullptr);
 }
 
 #ifdef __SWITCH__
@@ -543,6 +671,7 @@ void StreamView::KeyboardEnterCallback(const char* text, SwkbdDecidedEnterArg*) 
     active_keyboard_view_->keyboard_release_guard_ = true;
     if (active_keyboard_view_->session_)
         active_keyboard_view_->session_->record_ui_event("keyboard submitted");
+    opennow::LogRuntimeEvent("keyboard", "submitted", "source=swkbd");
 }
 
 void StreamView::KeyboardCancelCallback() {
@@ -555,6 +684,7 @@ void StreamView::KeyboardCancelCallback() {
     active_keyboard_view_->keyboard_release_guard_ = true;
     if (active_keyboard_view_->session_)
         active_keyboard_view_->session_->record_ui_event("keyboard cancelled");
+    opennow::LogRuntimeEvent("keyboard", "cancelled", "source=swkbd");
 }
 #endif
 
@@ -782,13 +912,22 @@ void StreamView::UpdatePerformanceCounter(const VideoPerformanceCounters& counte
 }
 
 void StreamView::DrawPerformanceOverlay(NVGcontext* vg, float x, float y) {
-    char text[80];
-    std::snprintf(text, sizeof(text), "IN %.0f  DEC %.0f  OUT %.0f", incoming_fps_, decoded_fps_, presented_fps_);
+    char text[112];
+    const int network_rtt_ms = session_ ? session_->get_network_rtt_ms() : -1;
+    if (network_rtt_ms >= 0) {
+        std::snprintf(text, sizeof(text),
+            "IN %.0f  DEC %.0f  OUT %.0f  |  RTT %d ms",
+            incoming_fps_, decoded_fps_, presented_fps_, network_rtt_ms);
+    } else {
+        std::snprintf(text, sizeof(text),
+            "IN %.0f  DEC %.0f  OUT %.0f  |  RTT --",
+            incoming_fps_, decoded_fps_, presented_fps_);
+    }
 
     const float box_x = x + 16.0f;
     const float box_y = y + 16.0f;
     nvgBeginPath(vg);
-    nvgRoundedRect(vg, box_x, box_y, 310.0f, 42.0f, 8.0f);
+    nvgRoundedRect(vg, box_x, box_y, 430.0f, 42.0f, 8.0f);
     nvgFillColor(vg, nvgRGBA(8, 12, 14, 205));
     nvgFill(vg);
 
@@ -1062,6 +1201,7 @@ void StreamView::draw(NVGcontext* vg, float x, float y, float width, float heigh
         UpdateInlineKeyboard();
 
         const auto stream_now = std::chrono::steady_clock::now();
+        UpdateRemoteEscapeKey(stream_now);
         UpdateSessionLimitNotice(stream_now);
         UpdateStreamEndState(stream_now);
         if (stream_end_reason_ != opennow::StreamEndReason::None &&
@@ -1095,28 +1235,37 @@ void StreamView::draw(NVGcontext* vg, float x, float y, float width, float heigh
 
         const bool keyboard_combo = state.buttons[brls::BUTTON_BACK] &&
                                     state.buttons[brls::BUTTON_Y];
+        if (!state.buttons[brls::BUTTON_BACK] &&
+            !state.buttons[brls::BUTTON_Y])
+        {
+            keyboard_combo_armed_ = true;
+        }
         bool keyboard_owned_input = keyboard_visible_ || nte_owned_input ||
             stream_end_reason_ != opennow::StreamEndReason::None;
-        if (keyboard_combo && !keyboard_combo_was_down_ && !nte_owned_input &&
+        if (keyboard_combo && keyboard_combo_armed_ && !nte_owned_input &&
             stream_end_reason_ == opennow::StreamEndReason::None) {
+            keyboard_combo_armed_ = false;
             OpenInlineKeyboard();
             keyboard_owned_input = keyboard_visible_;
         }
-        keyboard_combo_was_down_ = keyboard_combo;
-
         if (keyboard_visible_) {
             const bool b_down = state.buttons[brls::BUTTON_B];
             const bool plus_down = state.buttons[brls::BUTTON_START];
-            if (plus_down && !keyboard_plus_was_down_)
+            const bool escape_down = state.buttons[brls::BUTTON_LT];
+            if (escape_down && !keyboard_escape_was_down_)
+                SendEscapeKey("onscreen_zl");
+            else if (plus_down && !keyboard_plus_was_down_)
                 HideInlineKeyboard(true);
             else if (b_down && !keyboard_b_was_down_)
                 HideInlineKeyboard(false);
             keyboard_b_was_down_ = b_down;
             keyboard_plus_was_down_ = plus_down;
+            keyboard_escape_was_down_ = escape_down;
             keyboard_owned_input = true;
         } else {
             keyboard_b_was_down_ = false;
             keyboard_plus_was_down_ = false;
+            keyboard_escape_was_down_ = false;
         }
 
         if (!state.buttons[brls::BUTTON_B])
@@ -1130,6 +1279,7 @@ void StreamView::draw(NVGcontext* vg, float x, float y, float width, float heigh
                 state.buttons[brls::BUTTON_LEFT] || state.buttons[brls::BUTTON_RIGHT] ||
                 state.buttons[brls::BUTTON_LB] || state.buttons[brls::BUTTON_RB] ||
                 state.buttons[brls::BUTTON_LT] || state.buttons[brls::BUTTON_RT] ||
+                state.buttons[brls::BUTTON_LSB] || state.buttons[brls::BUTTON_RSB] ||
                 state.buttons[brls::BUTTON_START] || state.buttons[brls::BUTTON_BACK] ||
                 std::fabs(state.axes[brls::LEFT_X]) > 0.15f ||
                 std::fabs(state.axes[brls::LEFT_Y]) > 0.15f ||
@@ -1334,6 +1484,7 @@ void StreamView::draw(NVGcontext* vg, float x, float y, float width, float heigh
     DrawStreamEndNotice(vg, x, y, width, notice_now);
     if (stream_end_reason_ == opennow::StreamEndReason::None)
         DrawNteAutoLoginStatus(vg, x, y, width, height, notice_now);
+    DrawKeyboardControls(vg, x, y, width);
 
     brls::Box::draw(vg, x, y, width, height, style, ctx);
 }

@@ -221,6 +221,28 @@ int peer_connection_get_ice_candidate_pair_stats(PeerConnection* pc,
                                                  int* succeeded,
                                                  int* failed);
 
+typedef struct PeerIceCandidatePairInfo {
+  uint64_t priority;
+  int state;
+  int local_type;
+  int remote_type;
+  int connectivity_checks;
+  int selected;
+  int nominated;
+  char local_address[64];
+  char remote_address[64];
+  int local_port;
+  int remote_port;
+} PeerIceCandidatePairInfo;
+
+int peer_connection_get_ice_candidate_pair_count(PeerConnection* pc);
+
+int peer_connection_get_ice_candidate_pair_info(PeerConnection* pc,
+                                                int index,
+                                                PeerIceCandidatePairInfo* info);
+
+int peer_connection_get_rtt_ms(PeerConnection* pc);
+
 #ifdef __cplusplus
 }
 #endif

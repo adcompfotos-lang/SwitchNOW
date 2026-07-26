@@ -49,6 +49,14 @@ struct StreamTransportHealth {
     std::chrono::milliseconds video_idle {0};
 };
 
+struct StreamNetworkCounters {
+    std::uint32_t packets_received = 0;
+    std::uint32_t sequence_gaps = 0;
+    std::uint32_t late_packets_dropped = 0;
+    std::uint32_t access_units_dropped = 0;
+    std::uint32_t nack_requests = 0;
+};
+
 class WebRtcSession {
 public:
     WebRtcSession(
@@ -90,6 +98,8 @@ public:
     void on_rtp_sender_report(uint32_t ssrc, uint64_t ntp_us, uint32_t rtp_timestamp);
     int64_t video_target_rtp_timestamp() const;
     VideoPerformanceCounters get_video_performance() const;
+    int get_network_rtt_ms() const;
+    StreamNetworkCounters get_network_counters() const;
     StreamTransportHealth get_transport_health() const;
     std::string get_debug_info() const;
     bool is_terminal() const { return peer_terminal_.load(std::memory_order_acquire); }
@@ -211,6 +221,7 @@ private:
     std::chrono::steady_clock::time_point session_started_at_ {};
     std::chrono::steady_clock::time_point peer_completed_at_ {};
     std::chrono::steady_clock::time_point last_stream_diagnostic_log_ {};
+    std::string last_ice_candidate_pair_signature_;
     std::chrono::steady_clock::time_point last_video_metric_snapshot_ {};
     VideoPerformanceCounters last_logged_video_performance_ {};
     std::chrono::steady_clock::time_point last_startup_keyframe_request_ {};

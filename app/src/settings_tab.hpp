@@ -4,7 +4,9 @@
 
 #include <borealis.hpp>
 
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +20,7 @@ class SettingsTab : public brls::Box
 {
   public:
     SettingsTab();
+    ~SettingsTab() override;
 
     void willAppear(bool resetState) override;
 
@@ -53,6 +56,10 @@ class SettingsTab : public brls::Box
     bool CycleFrameRate(brls::View* view);
     bool CycleBitrate(brls::View* view);
     bool CycleImageQuality(brls::View* view);
+    bool ChooseServerLocation(brls::View* view);
+    bool RefreshServerLocations(brls::View* view);
+    void BeginServerLocationLoad(bool open_when_ready, bool notify_result);
+    std::string ServerLocationValue() const;
 
     brls::Box* MakeSection(const std::string& title, const std::string& subtitle = {});
     brls::Box* MakeOptionRow(
@@ -102,6 +109,13 @@ class SettingsTab : public brls::Box
     StreamSettings draft_settings_;
     bool settings_loaded_ = false;
     bool dirty_ = false;
+    std::vector<StreamRegion> server_locations_;
+    bool server_locations_loaded_ = false;
+    bool server_locations_loading_ = false;
+    bool open_server_location_when_ready_ = false;
+    std::string server_locations_error_;
+    std::shared_ptr<std::atomic_bool> alive_ =
+        std::make_shared<std::atomic_bool>(true);
 };
 
 } // namespace opennow

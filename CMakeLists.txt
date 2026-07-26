@@ -53,12 +53,19 @@ add_executable(${PROJECT_NAME} ${APP_SOURCES} ${PLATFORM_SOURCES})
 target_include_directories(${PROJECT_NAME}
     PRIVATE
         app/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/extern/borealis/library/lib/extern/glfw/deps
         ${CMAKE_CURRENT_SOURCE_DIR}/extern/ffmpeg/include
         ${CMAKE_CURRENT_SOURCE_DIR}/extern/libpeer/src
         ${CMAKE_CURRENT_SOURCE_DIR}/extern/libpeer/third_party/mbedtls/include
 )
 
-target_link_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extern/ffmpeg/lib)
+# Prefer the in-tree libpeer dependencies over portlibs archives with the same
+# names. Mixing mbedTLS versions produces TLS failures or an unusable NRO.
+target_link_directories(${PROJECT_NAME}
+    BEFORE PRIVATE
+        ${CMAKE_BINARY_DIR}/dist/lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/extern/ffmpeg/lib
+)
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE PLATFORM_SWITCH __SWITCH__ HAS_SOCKLEN_T=1)
 if (PLATFORM_SWITCH)
@@ -115,7 +122,7 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 set(PROJECT_AUTHOR "OpenCloudGaming")
-set(PROJECT_VERSION_STRING "1.0.1")
+set(PROJECT_VERSION_STRING "1.1.0")
 set(PROJECT_TITLEID "05004F4E4F575358")
 set(PROJECT_ICON ${CMAKE_CURRENT_SOURCE_DIR}/resources/icon/icon.jpg)
 set(PROJECT_ROMFS_DIR ${CMAKE_BINARY_DIR}/romfs)

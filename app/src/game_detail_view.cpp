@@ -2,6 +2,7 @@
 
 #include "app_state.hpp"
 #include "cover_image_cache.hpp"
+#include "description_scroll_policy.hpp"
 #include "nte_credentials.hpp"
 #include "ui_helpers.hpp"
 #include "localization.hpp"
@@ -13,12 +14,90 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <sstream>
 
 namespace opennow
 {
 namespace
 {
+
+class DescriptionScrollingFrame final : public brls::ScrollingFrame
+{
+  public:
+    DescriptionScrollingFrame(
+        brls::View* return_focus, brls::Label* focus_hint)
+        : return_focus_(return_focus)
+        , focus_hint_(focus_hint)
+    {
+        // Input is handled explicitly below. CENTERED prevents Borealis'
+        // natural mode from changing focus while an Up/Down press is also
+        // changing the description offset.
+        setScrollingBehavior(brls::ScrollingBehavior::CENTERED);
+        setHideHighlightBackground(true);
+        setHideHighlightBorder(true);
+        setBorderThickness(0.0f);
+        setBorderColor(nvgRGB(65, 229, 133));
+
+        registerAction(
+            "", brls::BUTTON_NAV_UP,
+            [this](brls::View*) {
+                return Scroll(DescriptionScrollDirection::Up);
+            },
+            true, true);
+        registerAction(
+            "", brls::BUTTON_NAV_DOWN,
+            [this](brls::View*) {
+                return Scroll(DescriptionScrollDirection::Down);
+            },
+            true, true);
+        registerAction(
+            "", brls::BUTTON_B,
+            [this](brls::View*) {
+                ReturnToButtons();
+                return true;
+            },
+            true);
+    }
+
+    void onFocusGained() override
+    {
+        brls::ScrollingFrame::onFocusGained();
+        setBorderThickness(3.0f);
+        if (focus_hint_)
+            focus_hint_->setVisibility(brls::Visibility::VISIBLE);
+    }
+
+    void onFocusLost() override
+    {
+        brls::ScrollingFrame::onFocusLost();
+        setBorderThickness(0.0f);
+        if (focus_hint_)
+            focus_hint_->setVisibility(brls::Visibility::GONE);
+    }
+
+  private:
+    bool Scroll(DescriptionScrollDirection direction)
+    {
+        const float maximum_offset =
+            std::max(0.0f, getContentHeight() - getHeight());
+        const DescriptionScrollResult result = AdvanceDescriptionScroll(
+            getContentOffsetY(), maximum_offset, direction, 48.0f);
+        setContentOffsetY(result.offset, false);
+        if (result.return_to_buttons)
+            ReturnToButtons();
+        return true;
+    }
+
+    void ReturnToButtons()
+    {
+        if (return_focus_)
+            brls::Application::giveFocus(return_focus_);
+    }
+
+    brls::View* return_focus_ = nullptr;
+    brls::Label* focus_hint_ = nullptr;
+};
 
 brls::Label* MakeLabel(const std::string& text, float size, NVGcolor color, float bottom_margin = 10.0f)
 {
@@ -28,6 +107,24 @@ brls::Label* MakeLabel(const std::string& text, float size, NVGcolor color, floa
     label->setTextColor(color);
     label->setMarginBottom(bottom_margin);
     return label;
+}
+
+float MeasureWrappedLabelHeight(
+    brls::Label* label, const std::string& text, float width)
+{
+    if (!label || text.empty() || width <= 0.0f)
+        return 0.0f;
+
+    NVGcontext* vg = brls::Application::getNVGContext();
+    nvgSave(vg);
+    nvgFontSize(vg, label->getFontSize());
+    nvgFontFaceId(vg, label->getFont());
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
+    nvgTextLineHeight(vg, label->getLineHeight());
+    float bounds[4] {};
+    nvgTextBoxBounds(vg, 0.0f, 0.0f, width, text.c_str(), nullptr, bounds);
+    nvgRestore(vg);
+    return std::max(0.0f, bounds[3] - bounds[1]);
 }
 
 std::string PrimaryStore(const GameInfo& game)
@@ -63,12 +160,76 @@ std::string SafeText(const std::string& value, const std::string& fallback)
 
 std::string VariantLabel(const GameVariant& variant)
 {
-    std::string label = SafeText(variant.store, "Unknown store");
+    std::string label = SafeText(variant.store, Tr("Unknown store"));
     if (variant.library_selected)
-        label += " (selected in library)";
+        label += " (" + Tr("selected in library") + ")";
     else if (!variant.library_status.empty())
         label += " (" + variant.library_status + ")";
     return label;
+}
+
+std::string HumanizeMetadata(std::string value)
+{
+    bool capitalize = true;
+    for (char& character : value)
+    {
+        if (character == '_' || character == '-')
+        {
+            character = ' ';
+            capitalize = true;
+            continue;
+        }
+        if (capitalize)
+        {
+            character = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(character)));
+            capitalize = false;
+        }
+        else
+        {
+            character = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(character)));
+        }
+    }
+    return value;
+}
+
+std::string JoinMetadata(
+    const std::vector<std::string>& values, size_t maximum = 4)
+{
+    std::ostringstream stream;
+    const size_t count = std::min(maximum, values.size());
+    for (size_t index = 0; index < count; ++index)
+    {
+        if (index > 0)
+            stream << "  /  ";
+        stream << Tr(HumanizeMetadata(values[index]));
+    }
+    return stream.str();
+}
+
+brls::Box* MakeTagRow(const std::vector<std::string>& values)
+{
+    auto* row = new brls::Box(brls::Axis::ROW);
+    row->setHeight(34);
+    row->setMarginBottom(8);
+    const size_t count = std::min<size_t>(4, values.size());
+    for (size_t index = 0; index < count; ++index)
+    {
+        const std::string text = Tr(HumanizeMetadata(values[index]));
+        auto* tag = new brls::Box(brls::Axis::ROW);
+        tag->setHeight(28);
+        tag->setWidth(std::min(142.0f, 24.0f + text.size() * 7.7f));
+        tag->setMarginRight(index + 1 < count ? 7.0f : 0.0f);
+        tag->setPadding(4, 9, 4, 9);
+        tag->setCornerRadius(6);
+        tag->setAlignItems(brls::AlignItems::CENTER);
+        tag->setJustifyContent(brls::JustifyContent::CENTER);
+        tag->setBackgroundColor(nvgRGB(31, 35, 41));
+        tag->addView(MakeLabel(text, 13.0f, nvgRGB(195, 202, 211), 0.0f));
+        row->addView(tag);
+    }
+    return row;
 }
 
 bool IsNumericLaunchId(const std::string& id)
@@ -130,100 +291,278 @@ GameDetailView::GameDetailView(const GfnClient& client, GameDetailData data)
             selected_variant_index_ = i;
     }
 
-    setPadding(28, 40, 28, 40);
+    setPadding(16, 30, 18, 30);
+    setBackgroundColor(nvgRGB(11, 12, 15));
 
-    auto* header = new brls::Header();
-    header->setTitle(data_.title);
-    header->setSubtitle(data_.subtitle);
-    addView(header);
+    auto* title_row = new brls::Box(brls::Axis::ROW);
+    title_row->setHeight(68);
+    title_row->setAlignItems(brls::AlignItems::CENTER);
+    title_row->setMarginBottom(6);
+    auto* title = MakeLabel(data_.title, 39.0f, nvgRGB(248, 249, 251), 0.0f);
+    title->setGrow(1.0f);
+    title_row->addView(title);
+    title_row->addView(MakeLabel(
+        data_.subtitle, 15.0f, nvgRGB(137, 145, 156), 0.0f));
+    addView(title_row);
 
     auto* content = new brls::Box(brls::Axis::ROW);
     content->setGrow(1.0f);
-    content->setMarginTop(16);
+    content->setMarginTop(8);
 
-    auto* poster_column = new brls::Box(brls::Axis::COLUMN);
-    poster_column->setWidth(350);
-    poster_column->setMarginRight(32);
+    auto* info_column = new brls::Box(brls::Axis::COLUMN);
+    info_column->setWidth(405);
+    info_column->setMarginRight(24);
+    info_column->setAlignItems(brls::AlignItems::STRETCH);
 
-    auto* poster = new brls::Image();
-    poster->setWidth(330);
-    poster->setHeight(470);
-    poster->setCornerRadius(12);
-    poster->setScalingType(brls::ImageScalingType::FILL);
-    poster->setMarginBottom(16);
-    SetCachedCoverImage(poster, data_.image_url);
-    poster_column->addView(poster);
+    auto* identity_text = new brls::Box(brls::Axis::COLUMN);
+    identity_text->setMarginBottom(12);
+    identity_text->addView(MakeLabel(
+        Tr(data_.owned ? "In your library" : "Supported in GeForce NOW"),
+        19.0f, nvgRGB(77, 218, 130), 8.0f));
+    if (!data_.content_ratings.empty())
+    {
+        identity_text->addView(MakeLabel(
+            JoinMetadata(data_.content_ratings, 2),
+            14.0f, nvgRGB(219, 223, 229), 7.0f));
+    }
+    if (!data_.genres.empty())
+        identity_text->addView(MakeTagRow(data_.genres));
+    if (!data_.supported_controls.empty())
+    {
+        identity_text->addView(MakeLabel(
+            Tr("Input") + ": " + JoinMetadata(data_.supported_controls, 3),
+            13.5f, nvgRGB(151, 159, 170), 6.0f));
+    }
+    if (!data_.membership_tier_label.empty())
+    {
+        identity_text->addView(MakeLabel(
+            Tr("Membership") + ": " + data_.membership_tier_label,
+            13.5f, nvgRGB(246, 196, 80), 0.0f));
+    }
+    info_column->addView(identity_text);
+
+    const bool has_nte_actions = IsNevernessToEverness(data_.title);
+    auto* actions = new brls::Box(brls::Axis::COLUMN);
+    actions->setMarginBottom(10);
 
     auto* play_button = new brls::Button();
     play_button->setStyle(&brls::BUTTONSTYLE_PRIMARY);
+    play_button->setHeight(50);
+    play_button->setCornerRadius(9);
     play_button->setText(Tr(data_.owned ? "Play on GeForce NOW" : "Play from Store"));
     play_button->registerClickAction([this](brls::View* view) {
         (void)view;
         Play();
         return true;
     });
-    poster_column->addView(play_button);
+    actions->addView(play_button);
 
     store_button_ = new brls::Button();
-    store_button_->setMarginTop(10);
+    store_button_->setHeight(44);
+    store_button_->setCornerRadius(8);
+    store_button_->setMarginTop(8);
     store_button_->registerClickAction([this](brls::View*) {
         ShowStoreSelector(false);
         return true;
     });
     UpdateStoreButton();
-    poster_column->addView(store_button_);
+    actions->addView(store_button_);
 
-    content->addView(poster_column);
+    const std::string studio = !data_.developer.empty()
+        ? data_.developer
+        : data_.publisher;
+    actions->addView(MakeLabel(
+        Tr("By") + " " + SafeText(studio, Tr("Unknown studio")) +
+            "  /  " + SafeText(data_.stores, Tr("Unknown store")),
+        14.0f, nvgRGB(166, 174, 184), 7.0f));
 
-    auto* info_column = new brls::Box(brls::Axis::COLUMN);
-    info_column->setGrow(1.0f);
-
-    info_column->addView(MakeLabel(data_.title, 34.0f, nvgRGB(245, 246, 248), 8.0f));
-    info_column->addView(MakeLabel(Tr(data_.owned ? "In your library" : "Supported in GeForce NOW"), 20.0f, nvgRGB(88, 230, 146), 22.0f));
-    info_column->addView(MakeLabel("Stores: " + SafeText(data_.stores, "Unknown"), 19.0f, nvgRGB(210, 214, 220)));
-    if (!data_.membership_tier_label.empty())
-    {
-        info_column->addView(MakeLabel(
-            "Membership: " + data_.membership_tier_label,
-            19.0f,
-            nvgRGB(246, 196, 80)));
-    }
-    info_column->addView(MakeLabel("Publisher: " + SafeText(data_.publisher, "Unknown"), 19.0f, nvgRGB(210, 214, 220)));
-    info_column->addView(MakeLabel("Last played: " + SafeText(data_.last_played, "Never"), 19.0f, nvgRGB(210, 214, 220)));
-    info_column->addView(MakeLabel("Launch App ID: " + SafeText(data_.launch_app_id, "Unavailable"), 17.0f, nvgRGB(140, 148, 158), 24.0f));
-
-    if (IsNevernessToEverness(data_.title))
+    if (has_nte_actions)
     {
         nte_button_ = new brls::Button();
-        nte_button_->setMarginBottom(18);
+        nte_button_->setHeight(44);
+        nte_button_->setMarginBottom(8);
         nte_button_->registerClickAction([this](brls::View*) {
             OpenNteCredentialsMenu();
             return true;
         });
         UpdateNteButton();
-        info_column->addView(nte_button_);
+        actions->addView(nte_button_);
     }
+    info_column->addView(actions);
 
+    auto* description_header = new brls::Box(brls::Axis::ROW);
+    description_header->setHeight(31);
+    description_header->setAlignItems(brls::AlignItems::CENTER);
+    auto* description_title = MakeLabel(
+        "About this game", 16.0f, nvgRGB(246, 248, 250), 0.0f);
+    description_title->setGrow(1.0f);
+    description_header->addView(description_title);
+    auto* description_focus_hint = MakeLabel(
+        "Up / Down  Scroll  |  B  Back",
+        12.0f,
+        nvgRGB(105, 220, 148),
+        0.0f);
+    description_focus_hint->setVisibility(brls::Visibility::GONE);
+    description_header->addView(description_focus_hint);
+    info_column->addView(description_header);
+
+    const std::string description_text = Tr(SafeText(
+        data_.description,
+        "No description is available yet for this title."));
     auto* description = MakeLabel(
-        SafeText(data_.description, "No description is available yet for this title."),
-        20.0f,
+        description_text,
+        15.5f,
         nvgRGB(232, 235, 240),
         0.0f);
     description->setSingleLine(false);
+    description->setWidth(365);
+    // Label defaults to max-height: 100%, which truncates wrapped text to the
+    // viewport and makes ScrollingFrame think there is almost nothing to
+    // scroll. Keep the full measured text height in the detached content.
+    description->setMaxHeight(brls::View::AUTO);
 
-    auto* description_frame = new brls::ScrollingFrame();
-    description_frame->setGrow(1.0f);
-    description_frame->setContentView(description);
+    auto* description_content = new brls::Box(brls::Axis::COLUMN);
+    description_content->setWidth(389);
+    description_content->setPadding(10, 12, 10, 12);
+    description_content->addView(description);
+
+    brls::View* description_return_focus =
+        nte_button_ ? static_cast<brls::View*>(nte_button_)
+                    : static_cast<brls::View*>(store_button_);
+    auto* description_frame = new DescriptionScrollingFrame(
+        description_return_focus, description_focus_hint);
+    const float measured_height =
+        MeasureWrappedLabelHeight(description, description_text, 365.0f);
+    const float maximum_height = has_nte_actions ? 205.0f : 255.0f;
+    const float viewport_height = std::clamp(
+        std::ceil(measured_height + 20.0f), 46.0f, maximum_height);
+    description_frame->setHeight(viewport_height);
+    description_frame->setShrink(1.0f);
+    description_frame->setCornerRadius(9);
+    description_frame->setBackgroundColor(nvgRGB(20, 23, 28));
+    description_frame->setContentView(description_content);
     info_column->addView(description_frame);
 
     content->addView(info_column);
+
+    auto* media_column = new brls::Box(brls::Axis::COLUMN);
+    media_column->setGrow(1.0f);
+    media_column->setAlignItems(brls::AlignItems::STRETCH);
+
+    media_urls_ = data_.screenshots;
+    if (media_urls_.empty() && !data_.hero_url.empty())
+        media_urls_.push_back(data_.hero_url);
+    if (media_urls_.empty() && !data_.image_url.empty())
+        media_urls_.push_back(data_.image_url);
+
+    screenshot_image_ = new brls::Image();
+    screenshot_image_->setHeight(420);
+    screenshot_image_->setCornerRadius(13);
+    screenshot_image_->setScalingType(brls::ImageScalingType::FILL);
+    screenshot_image_->setMarginBottom(8);
+    media_column->addView(screenshot_image_);
+
+    auto* dots = new brls::Box(brls::Axis::ROW);
+    dots->setHeight(24);
+    dots->setAlignItems(brls::AlignItems::CENTER);
+    dots->setJustifyContent(brls::JustifyContent::CENTER);
+    dots->setMarginBottom(6);
+    for (size_t index = 0; index < media_urls_.size(); ++index)
+    {
+        auto* dot = MakeLabel("●", 14.0f, nvgRGB(94, 101, 110), 0.0f);
+        dot->setWidth(20);
+        dot->setHorizontalAlign(brls::HorizontalAlign::CENTER);
+        screenshot_dots_.push_back(dot);
+        dots->addView(dot);
+    }
+    media_column->addView(dots);
+
+    if (media_urls_.size() > 1)
+    {
+        media_column->addView(MakeLabel(
+            "L / R  " + Tr("Browse screenshots"),
+            13.0f, nvgRGB(132, 140, 151), 5.0f));
+    }
+    if (!data_.feature_labels.empty())
+        media_column->addView(MakeTagRow(data_.feature_labels));
+    media_column->addView(MakeLabel(
+        Tr("Publisher") + ": " + SafeText(data_.publisher, Tr("Unknown")) +
+            "  /  " + Tr("Last played") + ": " +
+            SafeText(data_.last_played, Tr("Never")),
+        13.5f, nvgRGB(137, 145, 156), 0.0f));
+
+    UpdateScreenshot();
+    content->addView(media_column);
     addView(content);
 
-    registerAction("Back", brls::BUTTON_B, [](brls::View* view) {
+    if (media_urls_.size() > 1)
+    {
+        registerAction(Tr("Previous screenshot"), brls::BUTTON_LB, [this](brls::View*) {
+            ShowPreviousScreenshot();
+            return true;
+        });
+        registerAction(Tr("Next screenshot"), brls::BUTTON_RB, [this](brls::View*) {
+            ShowNextScreenshot();
+            return true;
+        });
+    }
+
+    registerAction(Tr("Back"), brls::BUTTON_B, [](brls::View* view) {
         (void)view;
         brls::Application::popActivity();
         return true;
     });
+}
+
+void GameDetailView::ShowPreviousScreenshot()
+{
+    if (media_urls_.empty())
+        return;
+    screenshot_index_ =
+        (screenshot_index_ + media_urls_.size() - 1) % media_urls_.size();
+    UpdateScreenshot();
+}
+
+void GameDetailView::ShowNextScreenshot()
+{
+    if (media_urls_.empty())
+        return;
+    screenshot_index_ = (screenshot_index_ + 1) % media_urls_.size();
+    UpdateScreenshot();
+}
+
+void GameDetailView::UpdateScreenshot()
+{
+    if (!screenshot_image_ || media_urls_.empty())
+        return;
+    screenshot_index_ = std::min(screenshot_index_, media_urls_.size() - 1);
+    const std::uint64_t generation =
+        screenshot_generation_->fetch_add(1) + 1;
+    const auto generation_state = screenshot_generation_;
+    SetCachedGalleryImage(
+        screenshot_image_,
+        media_urls_[screenshot_index_],
+        [generation_state, generation]() {
+            return generation_state->load() == generation;
+        });
+
+    if (media_urls_.size() > 1)
+    {
+        const size_t previous =
+            (screenshot_index_ + media_urls_.size() - 1) % media_urls_.size();
+        const size_t next = (screenshot_index_ + 1) % media_urls_.size();
+        PrefetchCachedGalleryImage(media_urls_[previous]);
+        if (next != previous)
+            PrefetchCachedGalleryImage(media_urls_[next]);
+    }
+
+    for (size_t index = 0; index < screenshot_dots_.size(); ++index)
+    {
+        screenshot_dots_[index]->setTextColor(
+            index == screenshot_index_
+                ? nvgRGB(105, 232, 151)
+                : nvgRGB(91, 98, 108));
+    }
 }
 
 void GameDetailView::Play()
@@ -266,8 +605,8 @@ void GameDetailView::UpdateNteButton()
         return;
     nte_button_->setText(
         LoadNteCredentials().valid()
-            ? "NTE Auto-login: Ready (L + X in game)"
-            : "NTE Auto-login: Set email and password");
+            ? Tr("NTE Auto-login: Ready") + " (L + X)"
+            : Tr("NTE Auto-login: Set email and password"));
 }
 
 void GameDetailView::ConfigureNteCredentials()
@@ -383,14 +722,22 @@ GameDetailData MakeLibraryGameDetail(const GameInfo& game)
     GameDetailData data;
     data.title         = game.title;
     data.game_id       = game.uuid.empty() ? game.id : game.uuid;
-    data.subtitle      = PrimaryStore(game) + " library title";
+    data.subtitle      = PrimaryStore(game) + " " + Tr("library title");
     data.image_url     = game.image_url;
+    data.poster_url    = game.poster_url;
+    data.hero_url      = game.hero_url;
+    data.screenshots   = game.screenshots;
     data.launch_app_id = game.launch_app_id;
     data.publisher     = game.publisher;
+    data.developer     = game.developer;
     data.description   = game.description;
     data.stores        = JoinStores(game);
     data.membership_tier_label = game.membership_tier_label;
     data.last_played   = game.last_played;
+    data.genres        = game.genres;
+    data.feature_labels = game.feature_labels;
+    data.content_ratings = game.content_ratings;
+    data.supported_controls = game.supported_controls;
     data.owned         = true;
     data.variants      = game.variants;
     data.variants.erase(
@@ -406,12 +753,22 @@ GameDetailData MakeCatalogGameDetail(const PublicGame& game)
     GameDetailData data;
     data.title         = game.title;
     data.game_id       = game.uuid.empty() ? game.id : game.uuid;
-    data.subtitle      = game.store + (game.is_in_library ? " library title" : " catalog title");
+    data.subtitle      = game.store + " " +
+        Tr(game.is_in_library ? "library title" : "catalog title");
     data.image_url     = game.image_url;
+    data.poster_url    = game.poster_url;
+    data.hero_url      = game.hero_url;
+    data.screenshots   = game.screenshots;
     data.launch_app_id = game.launch_app_id.empty() ? game.id : game.launch_app_id;
     data.publisher     = game.publisher;
+    data.developer     = game.developer;
+    data.description   = game.description;
     data.stores        = game.store;
     data.membership_tier_label = game.membership_tier_label;
+    data.genres        = game.genres;
+    data.feature_labels = game.feature_labels;
+    data.content_ratings = game.content_ratings;
+    data.supported_controls = game.supported_controls;
     data.owned         = game.is_in_library;
     data.variants      = game.variants;
     if (data.variants.empty())

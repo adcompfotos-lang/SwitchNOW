@@ -4,9 +4,11 @@
 #include "app_paths.hpp"
 #include "localization.hpp"
 #include "network_utils.hpp"
+#include "server_location_policy.hpp"
 #include "stream_settings.hpp"
 #include "stream_settings_policy.hpp"
 #include "stream_diagnostics.hpp"
+#include "ui_action_guard.hpp"
 #include "ui_helpers.hpp"
 
 #ifdef __SWITCH__
@@ -287,13 +289,22 @@ SettingsTab::SettingsTab()
     addView(body);
 
     registerAction("Save", brls::BUTTON_X, [this](brls::View* view) {
-        return SaveChanges(view);
+        return RunUiAction("settings_save", [this, view] {
+            SaveChanges(view);
+        });
     }, false, true);
     registerAction("Revert", brls::BUTTON_Y, [this](brls::View* view) {
-        return RevertChanges(view);
+        return RunUiAction("settings_revert", [this, view] {
+            RevertChanges(view);
+        });
     }, false, true);
 
     SelectCategory(Category::Stream);
+}
+
+SettingsTab::~SettingsTab()
+{
+    alive_->store(false, std::memory_order_release);
 }
 
 brls::Box* SettingsTab::MakeSection(const std::string& title, const std::string& subtitle)
@@ -556,6 +567,21 @@ void SettingsTab::BuildAccountPage()
 
 void SettingsTab::BuildStreamPage()
 {
+    auto* location = MakeSection(
+        "Server location",
+        "Use automatic routing or choose a specific GeForce NOW data center.");
+    location->addView(MakeOptionRow(
+        "Location",
+        "Locations are ranked by direct latency from this console.",
+        [this] { return ServerLocationValue(); },
+        [this](brls::View* view) { return ChooseServerLocation(view); }));
+    location->addView(MakeActionRow(
+        "Latency test",
+        "Reload available locations and test each connection again.",
+        "Refresh",
+        [this](brls::View* view) { return RefreshServerLocations(view); }));
+    content_container_->addView(location);
+
     auto* quality = MakeSection("Quality profile", "Start with a preset, then fine-tune individual values.");
     quality->addView(MakeOptionRow(
         "Preset", "Safe, Balanced or Quality baseline.",
@@ -586,7 +612,6 @@ void SettingsTab::BuildStreamPage()
         [this] { return draft_settings_.video_backend; },
         [this](brls::View* view) { return CycleVideoBackend(view); }));
     AddInfoLine(decoder, "Codec", "H.264, 8-bit 4:2:0");
-    AddInfoLine(decoder, "Server region", draft_settings_.region + " (best latency)");
     content_container_->addView(decoder);
 
     auto* defaults = MakeSection("Recovery", "A known-good baseline for Nintendo Switch hardware.");
@@ -712,7 +737,7 @@ void SettingsTab::BuildInterfacePage()
     content_container_->addView(language);
 
     auto* about = MakeSection("SwitchNOW", "Native GeForce NOW client for Nintendo Switch.");
-    AddInfoLine(about, "Version", "1.0.1");
+    AddInfoLine(about, "Version", "1.1.0");
     AddInfoLine(about, "Languages", "English + 7");
     content_container_->addView(about);
 }
@@ -741,6 +766,8 @@ bool SettingsTab::SaveChanges(brls::View* view)
         return true;
     }
 
+    const bool language_changed =
+        draft_settings_.interface_language != saved_settings_.interface_language;
     if (!SaveStreamSettings(draft_settings_))
     {
         ShowError("Settings Save Failed", "Could not safely write stream_settings.json to the SD card.");
@@ -758,7 +785,23 @@ bool SettingsTab::SaveChanges(brls::View* view)
         "Account", "Stream", "Game", "Controls", "Audio", "Storage", "Interface"};
     for (size_t index = 0; index < category_buttons_.size() && index < category_names.size(); ++index)
         category_buttons_[index]->setText(Tr(category_names[index]));
-    SelectCategory(category_);
+
+    // Never destroy the focused option row from inside its own X action.
+    // Borealis may still dispatch focus events after this callback returns,
+    // which previously left a dangling focus pointer and caused the crash.
+    if (language_changed)
+    {
+        const auto alive = alive_;
+        const Category selected_category = category_;
+        brls::sync([this, alive, selected_category] {
+            if (!alive->load())
+                return;
+            SelectCategory(selected_category);
+            const size_t selected = static_cast<size_t>(selected_category);
+            if (selected < category_buttons_.size())
+                brls::Application::giveFocus(category_buttons_[selected]);
+        });
+    }
     brls::Application::notify(Tr("Settings saved; changes apply to the next stream"));
     return true;
 }
@@ -1025,6 +1068,257 @@ bool SettingsTab::ClearCoverCache(brls::View* view)
     return true;
 }
 
+std::string SettingsTab::ServerLocationValue() const
+{
+    if (server_locations_loading_)
+        return Tr("Testing locations...");
+
+    const auto best = std::find_if(
+        server_locations_.begin(),
+        server_locations_.end(),
+        [](const StreamRegion& region) { return region.ping_ms >= 0; });
+
+    if (server_location::IsAutomatic(draft_settings_.region))
+    {
+        if (best == server_locations_.end())
+            return Tr("Auto (best)");
+        return Tr("Auto") + " - " + best->name + " - " +
+            std::to_string(best->ping_ms) + " ms";
+    }
+
+    const auto selected = std::find_if(
+        server_locations_.begin(),
+        server_locations_.end(),
+        [this](const StreamRegion& region) {
+            return region.url == draft_settings_.region;
+        });
+    if (selected == server_locations_.end())
+        return Tr("Selected server");
+
+    std::string value = selected->name;
+    if (selected->ping_ms >= 0)
+        value += " - " + std::to_string(selected->ping_ms) + " ms";
+    return value;
+}
+
+void SettingsTab::BeginServerLocationLoad(
+    bool open_when_ready,
+    bool notify_result)
+{
+    if (server_locations_loading_)
+    {
+        open_server_location_when_ready_ =
+            open_server_location_when_ready_ || open_when_ready;
+        if (notify_result)
+            brls::Application::notify(Tr("Server location test is already running"));
+        return;
+    }
+
+    EnsureSessionLoaded();
+    auto& state = AppState::Instance();
+    if (!state.HasSession())
+    {
+        if (open_when_ready || notify_result)
+        {
+            ShowError(
+                Tr("Server Locations Unavailable"),
+                Tr("Connect a GeForce NOW account before loading server locations."));
+        }
+        return;
+    }
+
+    server_locations_loading_ = true;
+    server_locations_error_.clear();
+    open_server_location_when_ready_ = open_when_ready;
+    UpdateOptionValues();
+
+    const std::shared_ptr<std::atomic_bool> alive = alive_;
+    AuthSession session = *state.session();
+    brls::async(
+        [this, alive, session = std::move(session), notify_result]() mutable {
+            try
+            {
+                GfnClient client;
+                std::vector<StreamRegion> regions =
+                    client.FetchStreamRegions(session);
+                regions =
+                    client.MeasureStreamRegionLatencies(std::move(regions));
+                std::stable_sort(
+                    regions.begin(),
+                    regions.end(),
+                    [](const StreamRegion& left, const StreamRegion& right) {
+                        const bool left_ok = left.ping_ms >= 0;
+                        const bool right_ok = right.ping_ms >= 0;
+                        if (left_ok != right_ok)
+                            return left_ok;
+                        if (left_ok && left.ping_ms != right.ping_ms)
+                            return left.ping_ms < right.ping_ms;
+                        return left.name < right.name;
+                    });
+
+                brls::sync(
+                    [this, alive, session = std::move(session),
+                     regions = std::move(regions), notify_result]() mutable {
+                        if (!alive->load(std::memory_order_acquire))
+                            return;
+
+                        auto& current = AppState::Instance();
+                        if (current.HasSession() &&
+                            current.session()->user.user_id ==
+                                session.user.user_id)
+                        {
+                            current.SetSession(std::move(session));
+                        }
+
+                        server_locations_ = std::move(regions);
+                        server_locations_loaded_ = true;
+                        server_locations_loading_ = false;
+                        if (server_locations_.empty())
+                        {
+                            server_locations_error_ =
+                                Tr("GeForce NOW did not return any server locations.");
+                        }
+                        UpdateOptionValues();
+
+                        const bool should_open =
+                            open_server_location_when_ready_ &&
+                            category_ == Category::Stream;
+                        open_server_location_when_ready_ = false;
+                        if (should_open)
+                        {
+                            ChooseServerLocation(nullptr);
+                        }
+                        else if (notify_result)
+                        {
+                            brls::Application::notify(
+                                server_locations_.empty()
+                                    ? server_locations_error_
+                                    : Tr("Server location latency test complete"));
+                        }
+                    });
+            }
+            catch (const std::exception& ex)
+            {
+                const std::string message = ex.what();
+                brls::sync([this, alive, message, notify_result] {
+                    if (!alive->load(std::memory_order_acquire))
+                        return;
+
+                    const bool should_open =
+                        open_server_location_when_ready_ &&
+                        category_ == Category::Stream;
+                    server_locations_loading_ = false;
+                    server_locations_loaded_ =
+                        !server_locations_.empty() || should_open;
+                    server_locations_error_ = message;
+                    open_server_location_when_ready_ = false;
+                    UpdateOptionValues();
+                    if (should_open)
+                    {
+                        brls::Application::notify(
+                            Tr("Latency test failed; automatic routing is still available"));
+                        ChooseServerLocation(nullptr);
+                    }
+                    else if (notify_result)
+                    {
+                        ShowError(Tr("Server Location Test Failed"), message);
+                    }
+                });
+            }
+        },
+        false);
+}
+
+bool SettingsTab::ChooseServerLocation(brls::View* view)
+{
+    (void)view;
+    if (server_locations_loading_)
+    {
+        open_server_location_when_ready_ = true;
+        brls::Application::notify(Tr("Testing GeForce NOW server locations..."));
+        return true;
+    }
+
+    if (!server_locations_loaded_)
+    {
+        BeginServerLocationLoad(true, false);
+        return true;
+    }
+
+    const auto best = std::find_if(
+        server_locations_.begin(),
+        server_locations_.end(),
+        [](const StreamRegion& region) { return region.ping_ms >= 0; });
+
+    std::vector<StreamRegion> options = server_locations_;
+    if (!server_location::IsAutomatic(draft_settings_.region))
+    {
+        const bool selected_available = std::any_of(
+            options.begin(),
+            options.end(),
+            [this](const StreamRegion& region) {
+                return region.url == draft_settings_.region;
+            });
+        if (!selected_available)
+        {
+            options.push_back(
+                {Tr("Current server (not advertised)"), draft_settings_.region, -1});
+        }
+    }
+
+    std::vector<std::string> labels;
+    labels.reserve(options.size() + 1);
+    std::string automatic = Tr("Auto (best)");
+    if (best != server_locations_.end())
+    {
+        automatic += " - " + best->name + " - " +
+            std::to_string(best->ping_ms) + " ms";
+    }
+    labels.push_back(std::move(automatic));
+
+    int selected_index = 0;
+    for (size_t index = 0; index < options.size(); ++index)
+    {
+        const StreamRegion& region = options[index];
+        std::string label = region.name;
+        if (region.ping_ms >= 0)
+            label += " - " + std::to_string(region.ping_ms) + " ms";
+        else
+            label += " - " + Tr("Unavailable");
+        if (best != server_locations_.end() && region.url == best->url)
+            label += " - " + Tr("Best");
+        labels.push_back(std::move(label));
+
+        if (region.url == draft_settings_.region)
+            selected_index = static_cast<int>(index + 1);
+    }
+
+    const std::shared_ptr<std::atomic_bool> alive = alive_;
+    auto* dropdown = new brls::Dropdown(
+        Tr("Server location"),
+        labels,
+        [this, alive, options = std::move(options)](int index) {
+            if (!alive->load(std::memory_order_acquire) || index < 0)
+                return;
+            draft_settings_.region =
+                index == 0 || static_cast<size_t>(index) > options.size()
+                ? "Auto"
+                : options[static_cast<size_t>(index - 1)].url;
+            MarkDirty();
+            UpdateOptionValues();
+        },
+        selected_index);
+    brls::Application::pushActivity(new brls::Activity(dropdown));
+    return true;
+}
+
+bool SettingsTab::RefreshServerLocations(brls::View* view)
+{
+    (void)view;
+    BeginServerLocationLoad(false, true);
+    return true;
+}
+
 bool SettingsTab::CycleStreamPreset(brls::View* view)
 {
     (void)view;
@@ -1032,6 +1326,7 @@ bool SettingsTab::CycleStreamPreset(brls::View* view)
     const int audio_volume = draft_settings_.audio_volume;
     const int audio_buffer_ms = draft_settings_.audio_buffer_ms;
     const std::string backend = draft_settings_.video_backend;
+    const std::string region = draft_settings_.region;
     const bool debug_diagnostics = draft_settings_.debug_diagnostics;
     const std::string game_language = draft_settings_.game_language;
     const bool persist_game_settings = draft_settings_.persist_game_settings;
@@ -1044,6 +1339,7 @@ bool SettingsTab::CycleStreamPreset(brls::View* view)
     draft_settings_.audio_volume = audio_volume;
     draft_settings_.audio_buffer_ms = audio_buffer_ms;
     draft_settings_.video_backend = backend;
+    draft_settings_.region = region;
     draft_settings_.debug_diagnostics = debug_diagnostics;
     draft_settings_.game_language = game_language;
     draft_settings_.persist_game_settings = persist_game_settings;
@@ -1058,6 +1354,11 @@ bool SettingsTab::ResetStreamPreset(brls::View* view)
 {
     (void)view;
 
+    const std::string region = draft_settings_.region;
+    const bool audio_enabled = draft_settings_.audio_enabled;
+    const int audio_volume = draft_settings_.audio_volume;
+    const int audio_buffer_ms = draft_settings_.audio_buffer_ms;
+    const std::string backend = draft_settings_.video_backend;
     const bool debug_diagnostics = draft_settings_.debug_diagnostics;
     const std::string game_language = draft_settings_.game_language;
     const bool persist_game_settings = draft_settings_.persist_game_settings;
@@ -1065,6 +1366,11 @@ bool SettingsTab::ResetStreamPreset(brls::View* view)
     const std::string image_quality_mode = draft_settings_.image_quality_mode;
     const std::string interface_language = draft_settings_.interface_language;
     draft_settings_ = StreamPresets()[1];
+    draft_settings_.region = region;
+    draft_settings_.audio_enabled = audio_enabled;
+    draft_settings_.audio_volume = audio_volume;
+    draft_settings_.audio_buffer_ms = audio_buffer_ms;
+    draft_settings_.video_backend = backend;
     draft_settings_.debug_diagnostics = debug_diagnostics;
     draft_settings_.game_language = game_language;
     draft_settings_.persist_game_settings = persist_game_settings;
@@ -1251,6 +1557,8 @@ bool SettingsTab::ShowDiagnostics(brls::View* view)
             "Paths:\n" +
             std::string(kAppHomePath) + "\n" +
             "boot.log: " + FileState(std::string(kAppHomePath) + "/boot.log") + "\n" +
+            "runtime.log (always on): " +
+                FileState(std::string(kAppHomePath) + "/runtime.log") + "\n" +
             "auth.log: " + FileState(std::string(kAppHomePath) + "/auth.log") + "\n" +
             "input.log: " + FileState(std::string(kAppHomePath) + "/input.log") + "\n" +
             "audio.log: " + FileState(std::string(kAppHomePath) + "/audio.log") + "\n" +

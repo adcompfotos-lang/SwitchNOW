@@ -70,7 +70,16 @@ struct PublicGame
     std::string title;
     std::string store;
     std::string publisher;
+    std::string developer;
+    std::string description;
     std::string image_url;
+    std::string poster_url;
+    std::string hero_url;
+    std::vector<std::string> screenshots;
+    std::vector<std::string> genres;
+    std::vector<std::string> feature_labels;
+    std::vector<std::string> content_ratings;
+    std::vector<std::string> supported_controls;
     std::string membership_tier_label;
     bool is_in_library = false;
     std::vector<GameVariant> variants;
@@ -84,7 +93,15 @@ struct GameInfo
     std::string title;
     std::string description;
     std::string publisher;
+    std::string developer;
     std::string image_url;
+    std::string poster_url;
+    std::string hero_url;
+    std::vector<std::string> screenshots;
+    std::vector<std::string> genres;
+    std::vector<std::string> feature_labels;
+    std::vector<std::string> content_ratings;
+    std::vector<std::string> supported_controls;
     std::string membership_tier_label;
     std::string last_played;
     bool is_in_library          = false;
@@ -98,6 +115,13 @@ struct IceServerInfo
     std::string url;
     std::string username;
     std::string credential;
+};
+
+struct StreamRegion
+{
+    std::string name;
+    std::string url;
+    int ping_ms = -1;
 };
 
 struct SessionInfo

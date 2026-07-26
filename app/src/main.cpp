@@ -13,9 +13,16 @@
 
 #include "main_activity.hpp"
 #include "app_paths.hpp"
+#include "cover_image_cache.hpp"
 #include "localization.hpp"
+#include "runtime_journal.hpp"
 #include "stream_diagnostics.hpp"
 #include "stream_settings.hpp"
+
+namespace
+{
+constexpr const char* kSwitchNowVersion = "1.1.0";
+}
 
 #ifdef __SWITCH__
 namespace
@@ -50,8 +57,9 @@ void ShowStartupFailure(const std::string& message)
 
     printf("SwitchNOW failed to start.\n\n");
     printf("%s\n\n", message.c_str());
-    printf("A boot log was written to:\n");
-    printf("sdmc:/switch/SwitchNOW/boot.log\n\n");
+    printf("Diagnostics were written to:\n");
+    printf("sdmc:/switch/SwitchNOW/boot.log\n");
+    printf("sdmc:/switch/SwitchNOW/runtime.log\n\n");
     printf("Press PLUS or B to exit.\n");
 
     while (appletMainLoop())
@@ -73,6 +81,7 @@ void ShowStartupFailure(const std::string& message)
 int main(int argc, char* argv[])
 {
     opennow::PrepareAppStorage();
+    opennow::InitializeRuntimeJournal(kSwitchNowVersion);
     AppendBootLog("boot: entered main()");
 
 #ifdef __SWITCH__
@@ -92,6 +101,17 @@ int main(int argc, char* argv[])
         }
 
         AppendBootLog("boot: curl_global_init ok");
+        if (const curl_version_info_data* version =
+                curl_version_info(CURLVERSION_NOW))
+        {
+            opennow::LogRuntimeEvent(
+                "tls", "backend",
+                "curl=" +
+                    std::string(version->version ? version->version : "unknown") +
+                    " ssl=" +
+                    std::string(
+                        version->ssl_version ? version->ssl_version : "unknown"));
+        }
         AppendBootLog("boot: calling brls::Application::init()");
 
         if (!brls::Application::init())
@@ -115,6 +135,11 @@ int main(int argc, char* argv[])
         brls::Application::setFPSStatus(false);
         opennow::SetStreamDiagnosticsEnabled(
             startup_settings.debug_diagnostics);
+        opennow::LogRuntimeEvent(
+            "diagnostics", "mode",
+            startup_settings.debug_diagnostics
+                ? "extended=enabled runtime=always_on"
+                : "extended=disabled runtime=always_on");
 
         AppendBootLog("boot: pushing main activity");
         brls::Application::pushActivity(new opennow::MainActivity());
@@ -124,18 +149,24 @@ int main(int argc, char* argv[])
             ;
 
         AppendBootLog("boot: main loop exited");
+        opennow::ShutdownImageCache();
+        opennow::ShutdownRuntimeJournal();
         curl_global_cleanup();
         return EXIT_SUCCESS;
     }
     catch (const std::exception& ex)
     {
+        opennow::LogRuntimeEvent("app", "unhandled_exception", ex.what());
         ShowStartupFailure(std::string("Unhandled exception: ") + ex.what());
     }
     catch (...)
     {
+        opennow::LogRuntimeEvent("app", "unhandled_exception", "unknown");
         ShowStartupFailure("Unhandled non-standard exception");
     }
 
+    opennow::ShutdownImageCache();
+    opennow::ShutdownRuntimeJournal();
     curl_global_cleanup();
     return EXIT_FAILURE;
 }

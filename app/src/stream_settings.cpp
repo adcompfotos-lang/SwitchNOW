@@ -2,6 +2,7 @@
 #include "app_paths.hpp"
 #include "atomic_file_replace.hpp"
 #include "localization.hpp"
+#include "server_location_policy.hpp"
 
 #include <jansson.h>
 
@@ -93,8 +94,15 @@ StreamSettings Sanitize(StreamSettings settings)
     if (settings.codec != "H264")
         settings.codec = "H264";
 
-    if (settings.region.empty())
+    if (server_location::IsAutomatic(settings.region))
         settings.region = "Auto";
+    else
+    {
+        settings.region =
+            server_location::NormalizeStreamingBaseUrl(settings.region);
+        if (settings.region.empty())
+            settings.region = "Auto";
+    }
 
     settings.audio_volume = std::max(800, std::min(1600, settings.audio_volume));
     settings.audio_buffer_ms = std::max(30, std::min(100, settings.audio_buffer_ms));

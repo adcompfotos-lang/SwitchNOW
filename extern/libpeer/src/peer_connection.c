@@ -8,6 +8,7 @@
 #include "agent.h"
 #include "config.h"
 #include "dtls_srtp.h"
+#include "ice_candidate_pair_policy.h"
 #include "peer_connection.h"
 #include "ports.h"
 #include "rtcp.h"
@@ -138,57 +139,6 @@ static void peer_connection_hex_preview(const uint8_t* data, int len, char* out,
   }
   if (len > count && pos + 5 < out_len) {
     snprintf(out + pos, out_len - pos, " ...");
-  }
-}
-
-static const char* peer_connection_ice_state_name(IceCandidateState state) {
-  switch (state) {
-    case ICE_CANDIDATE_STATE_FROZEN:
-      return "frozen";
-    case ICE_CANDIDATE_STATE_WAITING:
-      return "waiting";
-    case ICE_CANDIDATE_STATE_INPROGRESS:
-      return "inprogress";
-    case ICE_CANDIDATE_STATE_SUCCEEDED:
-      return "succeeded";
-    case ICE_CANDIDATE_STATE_FAILED:
-      return "failed";
-    default:
-      return "unknown";
-  }
-}
-
-static void peer_connection_log_candidate_pairs(PeerConnection* pc, const char* reason) {
-  if (!pc) {
-    return;
-  }
-
-  peer_connection_diag_log("ice_pairs reason=%s total=%d local=%d remote=%d mode=%d iceLite=%d",
-                           reason ? reason : "unknown",
-                           pc->agent.candidate_pairs_num,
-                           pc->agent.local_candidates_count,
-                           pc->agent.remote_candidates_count,
-                           pc->agent.mode,
-                           pc->remote_ice_lite);
-
-  for (int i = 0; i < pc->agent.candidate_pairs_num && i < 12; ++i) {
-    IceCandidatePair* pair = &pc->agent.candidate_pairs[i];
-    char local[ADDRSTRLEN] = {0};
-    char remote[ADDRSTRLEN] = {0};
-    if (pair->local) {
-      addr_to_string(&pair->local->addr, local, sizeof(local));
-    }
-    if (pair->remote) {
-      addr_to_string(&pair->remote->addr, remote, sizeof(remote));
-    }
-    peer_connection_diag_log("ice_pair[%d] state=%s local=%s:%u remote=%s:%u priority=%" PRIu64,
-                             i,
-                             peer_connection_ice_state_name(pair->state),
-                             local,
-                             pair->local ? pair->local->addr.port : 0,
-                             remote,
-                             pair->remote ? pair->remote->addr.port : 0,
-                             pair->priority);
   }
 }
 
@@ -487,7 +437,6 @@ int peer_connection_loop(PeerConnection* pc) {
         peer_connection_diag_log("dtls_start datachannel=%d candidatePairs=%d",
                                  pc->config.datachannel,
                                  pc->agent.candidate_pairs_num);
-        peer_connection_log_candidate_pairs(pc, "dtls_start");
       }
 
       pc->dtls_handshake_attempts++;
@@ -990,9 +939,13 @@ int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
     IceCandidatePair* pair = &agent->candidate_pairs[agent->candidate_pairs_num++];
     pair->local = &agent->local_candidates[i];
     pair->remote = remote;
-    pair->priority = pair->local->priority + pair->remote->priority;
+    pair->priority = ice_candidate_pair_priority(
+        pair->local->priority,
+        pair->remote->priority,
+        agent->mode == AGENT_MODE_CONTROLLING);
     pair->state = ICE_CANDIDATE_STATE_FROZEN;
   }
+  agent_sort_candidate_pairs(agent);
 
   return 0;
 }
@@ -1021,6 +974,46 @@ int peer_connection_get_ice_candidate_pair_stats(PeerConnection* pc,
     *failed = stats.failed;
   return 0;
 }
+
+int peer_connection_get_rtt_ms(PeerConnection* pc) {
+  if (!pc)
+    return -1;
+
+  const int ice_rtt_ms = agent_get_rtt_ms(&pc->agent);
+  return ice_rtt_ms >= 0 ? ice_rtt_ms : sctp_get_rtt_ms(&pc->sctp);
+}
+
+int peer_connection_get_ice_candidate_pair_count(PeerConnection* pc) {
+  return pc ? pc->agent.candidate_pairs_num : 0;
+}
+
+int peer_connection_get_ice_candidate_pair_info(PeerConnection* pc,
+                                                int index,
+                                                PeerIceCandidatePairInfo* info) {
+  if (!pc || !info || index < 0 || index >= pc->agent.candidate_pairs_num)
+    return -1;
+
+  memset(info, 0, sizeof(*info));
+  IceCandidatePair* pair = &pc->agent.candidate_pairs[index];
+  info->priority = pair->priority;
+  info->state = pair->state;
+  info->connectivity_checks = pair->conncheck;
+  info->selected = pc->agent.selected_pair == pair;
+  info->nominated = pc->agent.nominated_pair == pair;
+
+  if (pair->local) {
+    info->local_type = pair->local->type;
+    info->local_port = pair->local->addr.port;
+    addr_to_string(&pair->local->addr, info->local_address, sizeof(info->local_address));
+  }
+  if (pair->remote) {
+    info->remote_type = pair->remote->type;
+    info->remote_port = pair->remote->addr.port;
+    addr_to_string(&pair->remote->addr, info->remote_address, sizeof(info->remote_address));
+  }
+  return 0;
+}
+
 int peer_connection_get_video_rtp_stats(PeerConnection* pc, PeerVideoRtpStats* stats) {
   if (pc == NULL || stats == NULL)
     return -1;
