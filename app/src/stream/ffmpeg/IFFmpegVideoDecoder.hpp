@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #define VIDEO_FORMAT_H264 0x01
 #define VIDEO_FORMAT_H265 0x02
@@ -14,6 +15,7 @@
 
 #define VIDEO_DECODER_PREFER_HARDWARE 0x01
 #define VIDEO_DECODER_FORCE_SOFTWARE 0x02
+#define VIDEO_DECODER_REQUIRE_HARDWARE 0x04
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -63,4 +65,6 @@ class IFFmpegVideoDecoder {
     virtual int capabilities() const = 0;
     virtual VideoDecodeStats* video_decode_stats() = 0;
     virtual bool uses_hardware_frames() const = 0;
+    virtual const std::string& setup_diagnostics() const = 0;
+    virtual uint64_t corrupt_frames_dropped() const = 0;
 };

@@ -18,6 +18,9 @@
 #define AGENT_CONNCHECK_SWITCH 300
 #define AGENT_CONNCHECK_PERIOD 100
 #define AGENT_STUN_RECV_MAXTIMES 1000
+#define AGENT_RTT_PROBE_INTERVAL_MS 1000
+#define AGENT_RTT_PROBE_TIMEOUT_MS 1000
+#define AGENT_RTT_SAMPLE_MAX_MS 5000
 
 void agent_clear_candidates(Agent* agent) {
   agent->local_candidates_count = 0;
@@ -27,6 +30,27 @@ void agent_clear_candidates(Agent* agent) {
   agent->nominated_pair = NULL;
   agent->last_binding_request_sent_ms = 0;
   agent->smoothed_binding_rtt_ms = 0;
+  memset(agent->rtt_probe_transaction_id, 0,
+         sizeof(agent->rtt_probe_transaction_id));
+  memset(&agent->rtt_probe_remote_addr, 0,
+         sizeof(agent->rtt_probe_remote_addr));
+  agent->rtt_probe_started_ms = 0;
+  agent->rtt_probe_last_started_ms = 0;
+  agent->rtt_probe_last_sample_ms = 0;
+  agent->rtt_probe_sequence = 0;
+  agent->rtt_current_ms = 0;
+  agent->rtt_min_ms = 0;
+  agent->rtt_p95_ms = 0;
+  agent->rtt_jitter_q4 = 0;
+  memset(agent->rtt_samples, 0, sizeof(agent->rtt_samples));
+  agent->rtt_sample_count = 0;
+  agent->rtt_sample_cursor = 0;
+  agent->rtt_probes_sent = 0;
+  agent->rtt_probes_matched = 0;
+  agent->rtt_probes_lost = 0;
+  agent->rtt_probes_unmatched = 0;
+  agent->rtt_probe_in_flight = 0;
+  agent->rtt_monitoring_started = 0;
 }
 
 int agent_create(Agent* agent) {
@@ -63,7 +87,8 @@ void agent_destroy(Agent* agent) {
 #endif
 }
 
-static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len) {
+static int agent_socket_recv_timeout(Agent* agent, Address* addr, uint8_t* buf,
+                                     int len, int timeout_ms) {
   int ret = -1;
   int i = 0;
   int maxfd = -1;
@@ -76,7 +101,7 @@ static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len)
   };
 
   tv.tv_sec = 0;
-  tv.tv_usec = AGENT_POLL_TIMEOUT * 1000;
+  tv.tv_usec = timeout_ms * 1000;
   FD_ZERO(&rfds);
 
   for (i = 0; i < sizeof(addr_type) / sizeof(addr_type[0]); i++) {
@@ -110,7 +135,8 @@ static int agent_socket_recv_attempts(Agent* agent, Address* addr, uint8_t* buf,
   int ret = -1;
   int i = 0;
   for (i = 0; i < maxtimes; i++) {
-    if ((ret = agent_socket_recv(agent, addr, buf, len)) != 0) {
+    if ((ret = agent_socket_recv_timeout(agent, addr, buf, len,
+                                         AGENT_POLL_TIMEOUT)) != 0) {
       break;
     }
   }
@@ -327,22 +353,124 @@ static void agent_create_binding_response(Agent* agent, StunMessage* msg, Addres
   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->local_upwd, strlen(agent->local_upwd));
 }
 
-static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
+static void agent_create_binding_request(Agent* agent, IceCandidatePair* pair,
+                                         StunMessage* msg,
+                                         int include_use_candidate) {
   uint64_t tie_breaker = 0;  // always be controlled
   // send binding request
   stun_msg_create(msg, STUN_CLASS_REQUEST | STUN_METHOD_BINDING);
+  StunHeader* header = (StunHeader*)msg->buf;
+  const uint32_t now_ms = ports_get_epoch_time();
+  const uint32_t sequence = ++agent->rtt_probe_sequence;
+  header->transaction_id[0] = htonl(now_ms);
+  header->transaction_id[1] = htonl(sequence);
+  header->transaction_id[2] =
+      htonl(now_ms ^ sequence ^ UINT32_C(0x9e3779b9));
   char username[584];
   memset(username, 0, sizeof(username));
   snprintf(username, sizeof(username), "%s:%s", agent->remote_ufrag, agent->local_ufrag);
   stun_msg_write_attr(msg, STUN_ATTR_TYPE_USERNAME, strlen(username), username);
-  stun_msg_write_attr(msg, STUN_ATTR_TYPE_PRIORITY, 4, (char*)&agent->nominated_pair->priority);
+  stun_msg_write_attr(msg, STUN_ATTR_TYPE_PRIORITY, 4, (char*)&pair->priority);
   if (agent->mode == AGENT_MODE_CONTROLLING) {
-    stun_msg_write_attr(msg, STUN_ATTR_TYPE_USE_CANDIDATE, 0, NULL);
+    if (include_use_candidate) {
+      stun_msg_write_attr(msg, STUN_ATTR_TYPE_USE_CANDIDATE, 0, NULL);
+    }
     stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLING, 8, (char*)&tie_breaker);
   } else {
     stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLED, 8, (char*)&tie_breaker);
   }
   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->remote_upwd, strlen(agent->remote_upwd));
+}
+
+static int agent_send_rtt_probe(Agent* agent, IceCandidatePair* pair,
+                                int include_use_candidate) {
+  StunMessage msg;
+  uint32_t now_ms;
+  if (!agent || !pair || !pair->remote) {
+    return -1;
+  }
+
+  memset(&msg, 0, sizeof(msg));
+  agent_create_binding_request(agent, pair, &msg, include_use_candidate);
+  now_ms = ports_get_epoch_time();
+  if (agent_socket_send(agent, &pair->remote->addr, msg.buf, msg.size) < 0) {
+    // Rate-limit retries even when the socket rejects a probe immediately.
+    agent->rtt_probe_last_started_ms = now_ms;
+    return -1;
+  }
+
+  const StunHeader* header = (const StunHeader*)msg.buf;
+  memcpy(agent->rtt_probe_transaction_id, header->transaction_id,
+         sizeof(agent->rtt_probe_transaction_id));
+  memcpy(&agent->rtt_probe_remote_addr, &pair->remote->addr,
+         sizeof(agent->rtt_probe_remote_addr));
+  agent->rtt_probe_started_ms = now_ms;
+  agent->rtt_probe_last_started_ms = now_ms;
+  agent->last_binding_request_sent_ms = now_ms;
+  agent->rtt_probe_in_flight = 1;
+  agent->rtt_probes_sent++;
+  return 0;
+}
+
+static void agent_refresh_rtt_percentile(Agent* agent) {
+  uint32_t sorted[AGENT_RTT_SAMPLE_WINDOW];
+  const uint16_t count = agent->rtt_sample_count;
+  for (uint16_t i = 0; i < count; i++) {
+    sorted[i] = agent->rtt_samples[i];
+  }
+  for (uint16_t i = 1; i < count; i++) {
+    const uint32_t value = sorted[i];
+    uint16_t j = i;
+    while (j > 0 && sorted[j - 1] > value) {
+      sorted[j] = sorted[j - 1];
+      j--;
+    }
+    sorted[j] = value;
+  }
+  if (count > 0) {
+    const uint16_t percentile_index =
+        (uint16_t)(((uint32_t)count * 95 + 99) / 100 - 1);
+    agent->rtt_p95_ms = sorted[percentile_index];
+  }
+}
+
+static void agent_record_rtt_sample(Agent* agent, uint32_t sample_ms,
+                                    uint32_t now_ms) {
+  if (!agent || sample_ms == 0 || sample_ms > AGENT_RTT_SAMPLE_MAX_MS) {
+    return;
+  }
+
+  if (agent->rtt_current_ms != 0) {
+    const uint32_t difference =
+        sample_ms > agent->rtt_current_ms
+            ? sample_ms - agent->rtt_current_ms
+            : agent->rtt_current_ms - sample_ms;
+    const uint32_t previous_jitter = (agent->rtt_jitter_q4 + 8) >> 4;
+    if (difference >= previous_jitter) {
+      agent->rtt_jitter_q4 += difference - previous_jitter;
+    } else {
+      agent->rtt_jitter_q4 -= previous_jitter - difference;
+    }
+  }
+
+  agent->rtt_current_ms = sample_ms;
+  agent->rtt_min_ms =
+      agent->rtt_min_ms == 0 || sample_ms < agent->rtt_min_ms
+          ? sample_ms
+          : agent->rtt_min_ms;
+  agent->smoothed_binding_rtt_ms =
+      agent->smoothed_binding_rtt_ms == 0
+          ? sample_ms
+          : (agent->smoothed_binding_rtt_ms * 7 + sample_ms) / 8;
+  agent->rtt_probe_last_sample_ms = now_ms;
+  agent->rtt_samples[agent->rtt_sample_cursor] = sample_ms;
+  agent->rtt_sample_cursor =
+      (uint16_t)((agent->rtt_sample_cursor + 1) % AGENT_RTT_SAMPLE_WINDOW);
+  if (agent->rtt_sample_count < AGENT_RTT_SAMPLE_WINDOW) {
+    agent->rtt_sample_count++;
+  }
+  // Recalculate only when a new sample arrives, never from the render thread.
+  agent_refresh_rtt_percentile(agent);
 }
 
 void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr) {
@@ -363,23 +491,45 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
   }
 }
 
-void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
+void agent_process_stun_response(Agent* agent, StunMessage* stun_msg,
+                                 Address* addr) {
   switch (stun_msg->stunmethod) {
     case STUN_METHOD_BINDING:
       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->remote_upwd) == 0) {
         const uint32_t now_ms = ports_get_epoch_time();
-        if (agent->last_binding_request_sent_ms != 0) {
-          const uint32_t sample_ms =
-              now_ms - agent->last_binding_request_sent_ms;
-          if (sample_ms > 0 && sample_ms <= 5000) {
-            agent->smoothed_binding_rtt_ms =
-                agent->smoothed_binding_rtt_ms == 0
-                    ? sample_ms
-                    : (agent->smoothed_binding_rtt_ms * 7 + sample_ms) / 8;
+        const StunHeader* header = (const StunHeader*)stun_msg->buf;
+        const int transaction_matches =
+            agent->rtt_probe_in_flight &&
+            memcmp(header->transaction_id,
+                   agent->rtt_probe_transaction_id,
+                   sizeof(agent->rtt_probe_transaction_id)) == 0;
+        const int address_matches =
+            transaction_matches &&
+            addr_equal(addr, &agent->rtt_probe_remote_addr);
+        if (!transaction_matches || !address_matches) {
+          agent->rtt_probes_unmatched++;
+          // ICE connectivity checks may retransmit while an older response is
+          // still in flight. Such a response can establish the pair, but must
+          // never be used as an RTT sample because its send time is ambiguous.
+          if (!agent->selected_pair && agent->nominated_pair &&
+              agent->nominated_pair->state ==
+                  ICE_CANDIDATE_STATE_INPROGRESS &&
+              addr_equal(addr, &agent->nominated_pair->remote->addr)) {
+            agent->nominated_pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
+            agent->binding_request_time = now_ms;
           }
-          agent->last_binding_request_sent_ms = 0;
+          break;
         }
-        agent->nominated_pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
+
+        const uint32_t sample_ms = now_ms - agent->rtt_probe_started_ms;
+        agent_record_rtt_sample(agent, sample_ms, now_ms);
+        agent->rtt_probes_matched++;
+        agent->rtt_probe_in_flight = 0;
+        agent->rtt_probe_started_ms = 0;
+        agent->last_binding_request_sent_ms = 0;
+        if (agent->nominated_pair) {
+          agent->nominated_pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
+        }
         agent->binding_request_time = now_ms;
       }
       break;
@@ -388,11 +538,11 @@ void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
   }
 }
 
-int agent_recv(Agent* agent, uint8_t* buf, int len) {
+int agent_recv_timeout(Agent* agent, uint8_t* buf, int len, int timeout_ms) {
   int ret = -1;
   StunMessage stun_msg;
   Address addr;
-  if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0) {
+  if ((ret = agent_socket_recv_timeout(agent, &addr, buf, len, timeout_ms)) > 0) {
     agent->binding_request_time = ports_get_epoch_time();
   }
   if (ret > 0 && stun_probe(buf, len) == 0) {
@@ -404,7 +554,7 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
         agent_process_stun_request(agent, &stun_msg, &addr);
         break;
       case STUN_CLASS_RESPONSE:
-        agent_process_stun_response(agent, &stun_msg);
+        agent_process_stun_response(agent, &stun_msg, &addr);
         break;
       case STUN_CLASS_ERROR:
         break;
@@ -414,6 +564,10 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
     ret = 0;
   }
   return ret;
+}
+
+int agent_recv(Agent* agent, uint8_t* buf, int len) {
+  return agent_recv_timeout(agent, buf, len, AGENT_POLL_TIMEOUT);
 }
 
 void agent_set_remote_description(Agent* agent, char* description) {
@@ -513,23 +667,16 @@ static int agent_has_frozen_candidate_pair(Agent* agent, int start) {
 int agent_connectivity_check(Agent* agent) {
   char addr_string[ADDRSTRLEN];
   uint8_t buf[1400];
-  StunMessage msg;
 
   if (agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {
     LOGI("nominated pair is not in progress");
     return -1;
   }
 
-  memset(&msg, 0, sizeof(msg));
-
   if (agent->nominated_pair->conncheck % AGENT_CONNCHECK_PERIOD == 0) {
     addr_to_string(&agent->nominated_pair->remote->addr, addr_string, sizeof(addr_string));
     LOGD("send binding request to remote ip: %s, port: %d", addr_string, agent->nominated_pair->remote->addr.port);
-    agent_create_binding_request(agent, &msg);
-    if (agent_socket_send(
-            agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size) >= 0) {
-      agent->last_binding_request_sent_ms = ports_get_epoch_time();
-    }
+    (void)agent_send_rtt_probe(agent, agent->nominated_pair, 1);
   }
 
   agent_recv(agent, buf, sizeof(buf));
@@ -623,7 +770,89 @@ void agent_get_candidate_pair_stats(Agent* agent, AgentCandidatePairStats* stats
 }
 
 int agent_get_rtt_ms(Agent* agent) {
-  return agent && agent->smoothed_binding_rtt_ms > 0
-      ? (int)agent->smoothed_binding_rtt_ms
+  return agent && agent->rtt_current_ms > 0
+      ? (int)agent->rtt_current_ms
       : -1;
+}
+
+void agent_get_rtt_stats(Agent* agent, AgentRttStats* stats) {
+  if (!stats) {
+    return;
+  }
+
+  memset(stats, 0, sizeof(*stats));
+  stats->current_ms = -1;
+  stats->smoothed_ms = -1;
+  stats->min_ms = -1;
+  stats->p95_ms = -1;
+  stats->jitter_ms = -1;
+  if (!agent) {
+    return;
+  }
+
+  stats->current_ms =
+      agent->rtt_current_ms > 0 ? (int)agent->rtt_current_ms : -1;
+  stats->smoothed_ms = agent->smoothed_binding_rtt_ms > 0
+                           ? (int)agent->smoothed_binding_rtt_ms
+                           : -1;
+  stats->min_ms = agent->rtt_min_ms > 0 ? (int)agent->rtt_min_ms : -1;
+  stats->p95_ms = agent->rtt_p95_ms > 0 ? (int)agent->rtt_p95_ms : -1;
+  stats->jitter_ms = agent->rtt_sample_count > 1
+                         ? (int)((agent->rtt_jitter_q4 + 8) >> 4)
+                         : 0;
+  stats->sample_age_ms =
+      agent->rtt_probe_last_sample_ms > 0
+          ? ports_get_epoch_time() - agent->rtt_probe_last_sample_ms
+          : UINT32_MAX;
+  stats->samples = agent->rtt_probes_matched;
+  stats->probes_sent = agent->rtt_probes_sent;
+  stats->probes_matched = agent->rtt_probes_matched;
+  stats->probes_lost = agent->rtt_probes_lost;
+  stats->probes_unmatched = agent->rtt_probes_unmatched;
+  stats->probe_in_flight = agent->rtt_probe_in_flight;
+}
+
+void agent_rtt_probe_tick(Agent* agent) {
+  if (!agent || !agent->selected_pair || !agent->selected_pair->remote) {
+    return;
+  }
+
+  const uint32_t now_ms = ports_get_epoch_time();
+  if (!agent->rtt_monitoring_started) {
+    // Initial ICE checks can be retransmitted, so their timing is not suitable
+    // for live telemetry. Start a clean sample window on the selected pair.
+    agent->rtt_probe_in_flight = 0;
+    agent->rtt_probe_started_ms = 0;
+    agent->rtt_probe_last_started_ms = 0;
+    agent->rtt_probe_last_sample_ms = 0;
+    agent->last_binding_request_sent_ms = 0;
+    agent->smoothed_binding_rtt_ms = 0;
+    agent->rtt_current_ms = 0;
+    agent->rtt_min_ms = 0;
+    agent->rtt_p95_ms = 0;
+    agent->rtt_jitter_q4 = 0;
+    memset(agent->rtt_samples, 0, sizeof(agent->rtt_samples));
+    agent->rtt_sample_count = 0;
+    agent->rtt_sample_cursor = 0;
+    agent->rtt_probes_sent = 0;
+    agent->rtt_probes_matched = 0;
+    agent->rtt_probes_lost = 0;
+    agent->rtt_probes_unmatched = 0;
+    agent->rtt_monitoring_started = 1;
+  }
+
+  if (agent->rtt_probe_in_flight &&
+      now_ms - agent->rtt_probe_started_ms >= AGENT_RTT_PROBE_TIMEOUT_MS) {
+    agent->rtt_probe_in_flight = 0;
+    agent->rtt_probe_started_ms = 0;
+    agent->last_binding_request_sent_ms = 0;
+    agent->rtt_probes_lost++;
+  }
+
+  if (!agent->rtt_probe_in_flight &&
+      (agent->rtt_probe_last_started_ms == 0 ||
+       now_ms - agent->rtt_probe_last_started_ms >=
+           AGENT_RTT_PROBE_INTERVAL_MS)) {
+    (void)agent_send_rtt_probe(agent, agent->selected_pair, 0);
+  }
 }

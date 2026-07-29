@@ -354,6 +354,8 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
             }
 
             int unknown_status_polls = 0;
+            bool provider_fallback_used = false;
+            int app_patching_retries = 0;
             
             while (info.status != 2 && info.status != 3) {
                 if (info.status > 3 && info.status != 6) {
@@ -388,7 +390,77 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
 
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 if (!launch_state->running) return;
-                info = bg_client.PollSession(bg_auth, info.session_id);
+                try
+                {
+                    info = bg_client.PollSession(bg_auth, info.session_id);
+                }
+                catch (const AutomaticRegionSessionLost&)
+                {
+                    if (provider_fallback_used)
+                        throw;
+
+                    provider_fallback_used = true;
+                    unknown_status_polls = 0;
+                    post_progress(
+                        1,
+                        "Trying another server",
+                        "The fastest region could not keep the cloud session. "
+                        "Retrying through NVIDIA's automatic server routing.",
+                        0.30f);
+                    info = bg_client.StartSession(
+                        bg_auth,
+                        bg_app_id,
+                        bg_store,
+                        bg_internal_title,
+                        true);
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            launch_state->mutex);
+                        launch_state->session_id = info.session_id;
+                    }
+                }
+                catch (const CloudSessionNotFound&)
+                {
+                    if (!info.app_patching)
+                        throw;
+                    if (app_patching_retries >= 2)
+                    {
+                        throw std::runtime_error(
+                            "This game is currently being updated on NVIDIA "
+                            "servers. SwitchNOW tried again, but no cloud rig "
+                            "is available yet. Please try again later.");
+                    }
+
+                    ++app_patching_retries;
+                    provider_fallback_used = true;
+                    unknown_status_polls = 0;
+                    post_progress(
+                        1,
+                        "Updating the game",
+                        "NVIDIA is patching this title. Waiting before retry " +
+                            std::to_string(app_patching_retries) + " of 2.",
+                        0.42f);
+
+                    for (int wait_step = 0; wait_step < 60; ++wait_step)
+                    {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(250));
+                        if (!launch_state->running)
+                            return;
+                    }
+
+                    info = bg_client.StartSession(
+                        bg_auth,
+                        bg_app_id,
+                        bg_store,
+                        bg_internal_title,
+                        true);
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            launch_state->mutex);
+                        launch_state->session_id = info.session_id;
+                    }
+                }
             }
 
             if (info.signaling_url.empty()) {

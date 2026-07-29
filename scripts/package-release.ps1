@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.1.0",
+    [string]$Version = "1.1.5",
     [string]$BuildDirectory = "switch",
     [string]$Flavor = ""
 )
@@ -44,6 +44,18 @@ Copy-Item -LiteralPath $nro -Destination $versionedNro -Force
 Copy-Item -LiteralPath (Join-Path $repo "resources\icon\icon.jpg") -Destination (Join-Path $switchDir "icon.jpg") -Force
 Copy-Item -LiteralPath (Join-Path $repo "resources\icon\icon.png") -Destination (Join-Path $switchDir "icon.png") -Force
 Copy-Item -LiteralPath (Join-Path $repo "README.md") -Destination (Join-Path $packageRoot "README.md") -Force
+Copy-Item -LiteralPath (Join-Path $repo "docs\PATCH_NOTES_1.x_RU.md") `
+    -Destination (Join-Path $packageRoot "CHANGELOG_RU.md") -Force
+$releaseNotes = Join-Path $repo ("docs\RELEASE_NOTES_{0}_RU.md" -f $Version)
+if (Test-Path -LiteralPath $releaseNotes) {
+    Copy-Item -LiteralPath $releaseNotes `
+        -Destination (Join-Path $packageRoot "RELEASE_NOTES_RU.md") -Force
+}
+$versionChanges = Join-Path $repo "docs\CHANGES_1.1.1_TO_1.1.5_RU.md"
+if (Test-Path -LiteralPath $versionChanges) {
+    Copy-Item -LiteralPath $versionChanges `
+        -Destination (Join-Path $packageRoot "CHANGES_1.1.1_TO_1.1.5_RU.md") -Force
+}
 
 $manifest = @"
 SwitchNOW $Version
@@ -58,6 +70,9 @@ Included:
 - switch/SwitchNOW/icon.jpg
 - switch/SwitchNOW/icon.png
 - README.md
+- CHANGELOG_RU.md
+- RELEASE_NOTES_RU.md
+- CHANGES_1.1.1_TO_1.1.5_RU.md
 "@
 
 Set-Content -LiteralPath (Join-Path $packageRoot "INSTALL.txt") -Value $manifest -Encoding ASCII

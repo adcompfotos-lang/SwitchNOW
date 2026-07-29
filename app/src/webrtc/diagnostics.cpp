@@ -234,7 +234,20 @@ void WebRtcSession::log_stream_summary(const char* reason) {
             pc_, &pair_total, &pair_frozen, &pair_checking, &pair_succeeded, &pair_failed);
         (void)peer_connection_get_video_rtp_stats(pc_, &rtp_stats);
     }
-    const int network_rtt_ms = pc_ ? peer_connection_get_rtt_ms(pc_) : -1;
+    PeerNetworkRttStats network_rtt {};
+    network_rtt.current_ms = -1;
+    network_rtt.stun_current_ms = -1;
+    network_rtt.sctp_current_ms = -1;
+    network_rtt.min_ms = -1;
+    network_rtt.p95_ms = -1;
+    network_rtt.jitter_ms = -1;
+    if (pc_)
+        (void)peer_connection_get_rtt_stats(pc_, &network_rtt);
+    const char* rtt_source =
+        network_rtt.source == PEER_RTT_SOURCE_STUN ? "stun" :
+        network_rtt.source == PEER_RTT_SOURCE_SCTP ? "sctp" : "none";
+    const int64_t rtt_sample_age_ms =
+        network_rtt.samples > 0 ? static_cast<int64_t>(network_rtt.stun_sample_age_ms) : -1;
     const auto& frame_holder = AVFrameHolder::instance();
     VideoRenderStats render_backend_stats {};
     if (renderer_) {
@@ -255,7 +268,20 @@ void WebRtcSession::log_stream_summary(const char* reason) {
                     "/" + std::to_string(pair_checking) +
                     "/" + std::to_string(pair_succeeded) +
                     "/" + std::to_string(pair_failed) +
-                    " rttMs=" + std::to_string(network_rtt_ms) +
+                    " rttMs=" + std::to_string(network_rtt.current_ms) +
+                    " rttSource=" + rtt_source +
+                    " rttStunMs=" + std::to_string(network_rtt.stun_current_ms) +
+                    " rttSctpMs=" + std::to_string(network_rtt.sctp_current_ms) +
+                    " rttMinMs=" + std::to_string(network_rtt.min_ms) +
+                    " rttP95Ms=" + std::to_string(network_rtt.p95_ms) +
+                    " rttJitterMs=" + std::to_string(network_rtt.jitter_ms) +
+                    " rttSampleAgeMs=" + std::to_string(rtt_sample_age_ms) +
+                    " rttSamples=" + std::to_string(network_rtt.samples) +
+                    " stunProbe=" + std::to_string(network_rtt.probes_sent) +
+                    "/" + std::to_string(network_rtt.probes_matched) +
+                    "/" + std::to_string(network_rtt.probes_lost) +
+                    "/" + std::to_string(network_rtt.probes_unmatched) +
+                    "/" + std::to_string(network_rtt.probe_in_flight) +
                     " hbRx=" + std::to_string(heartbeat_rx_count_) +
                     " hbTx=" + std::to_string(heartbeat_tx_count_) +
                     " dcOpen=" + std::to_string(datachannel_opened_ ? 1 : 0) +
@@ -294,16 +320,30 @@ void WebRtcSession::log_stream_summary(const char* reason) {
                     " gpu retained/mappings=" +
                     std::to_string(render_backend_stats.retained_surfaces) + "/" +
                     std::to_string(render_backend_stats.surface_mappings) +
-                    " rtp packets/gaps/reordered/late/forced/buffered=" +
+                    " rtp packets/gaps/reordered/late/forced/startupRebase/buffered=" +
                     std::to_string(rtp_stats.packets_received) + "/" +
                     std::to_string(rtp_stats.sequence_gaps) + "/" +
                     std::to_string(rtp_stats.reordered_packets) + "/" +
                     std::to_string(rtp_stats.late_packets_dropped) + "/" +
                     std::to_string(rtp_stats.forced_sequence_skips) + "/" +
+                    std::to_string(rtp_stats.startup_sequence_rebases) + "/" +
                     std::to_string(rtp_stats.reorder_buffered_packets) +
-                    " nack requests/packets=" +
+                    " adaptive hold/recovered/expired/fastForward=" +
+                    std::to_string(rtp_stats.reorder_adaptive_holds) + "/" +
+                    std::to_string(rtp_stats.reorder_gap_recoveries) + "/" +
+                    std::to_string(rtp_stats.reorder_gap_expirations) + "/" +
+                    std::to_string(rtp_stats.reorder_burst_fast_forwards) +
+                    " grace regular/burst=" +
+                    std::to_string(rtp_stats.reorder_gap_hold_ms) + "/" +
+                    std::to_string(rtp_stats.reorder_burst_gap_hold_ms) +
+                    " nack requests/packets/retries=" +
                     std::to_string(rtp_stats.nack_requests) + "/" +
-                    std::to_string(rtp_stats.nack_packets_requested) +
+                    std::to_string(rtp_stats.nack_packets_requested) + "/" +
+                    std::to_string(rtp_stats.nack_retries) +
+                    " rtx received/recovered/invalid=" +
+                    std::to_string(rtp_stats.rtx_packets_received) + "/" +
+                    std::to_string(rtp_stats.rtx_packets_recovered) + "/" +
+                    std::to_string(rtp_stats.rtx_packets_invalid) +
                     " rtpAu ok/drop=" + std::to_string(rtp_stats.access_units_completed) + "/" +
                     std::to_string(rtp_stats.access_units_dropped) +
                     " frameQueue size/dropTiming/dropOverflow/hold/reuse=" +
@@ -311,7 +351,38 @@ void WebRtcSession::log_stream_summary(const char* reason) {
                     std::to_string(frame_holder.getTimingDropStat()) + "/" +
                     std::to_string(frame_holder.getOverflowDropStat()) + "/" +
                     std::to_string(frame_holder.getTimingHoldStat()) + "/" +
-                    std::to_string(frame_holder.getFakeFrameStat()));
+                    std::to_string(frame_holder.getFakeFrameStat()) +
+                    " frameCause reuseEmpty/holdEarly/wait/recovered/timeout/predictSkip/startupHold=" +
+                    std::to_string(frame_holder.getQueueEmptyReuseStat()) + "/" +
+                    std::to_string(frame_holder.getTimingHoldStat()) + "/" +
+                    std::to_string(frame_holder.getBriefWaitStat()) + "/" +
+                    std::to_string(frame_holder.getBriefWaitRecoveredStat()) + "/" +
+                    std::to_string(frame_holder.getBriefWaitTimeoutStat()) + "/" +
+                    std::to_string(frame_holder.getPredictiveWaitSkippedStat()) + "/" +
+                    std::to_string(frame_holder.getStartupHoldStat()) +
+                    " waitUs total/max=" +
+                    std::to_string(frame_holder.getBriefWaitTotalUs()) + "/" +
+                    std::to_string(frame_holder.getBriefWaitMaximumUs()) +
+                    " producer interval/jitterUs=" +
+                    std::to_string(frame_holder.getObservedProducerIntervalUs()) + "/" +
+                    std::to_string(frame_holder.getObservedProducerJitterUs()) +
+                    " sourcePacing rtpPeriod/early/phase/external/bypass/reuseNow/reuseMax=" +
+                    std::to_string(frame_holder.getObservedProducerRtpTicks()) + "/" +
+                    std::to_string(frame_holder.getPacingEarlyToleranceTicks()) + "/" +
+                    std::to_string(frame_holder.getLastPacingPhaseTicks()) + "/" +
+                    std::to_string(frame_holder.getSourceClockPresentStat()) + "/" +
+                    std::to_string(frame_holder.getClockBypassPresentStat()) + "/" +
+                    std::to_string(frame_holder.getCurrentConsecutiveReuse()) + "/" +
+                    std::to_string(frame_holder.getMaximumConsecutiveReuse()) +
+                    " dropCause timing/overflow/decoderResync/decoderOverflow/decoderStall/corrupt/renderLate/transportGap=" +
+                    std::to_string(frame_holder.getTimingDropStat()) + "/" +
+                    std::to_string(frame_holder.getOverflowDropStat()) + "/" +
+                    std::to_string(decoder_resync_drops_.load()) + "/" +
+                    std::to_string(decoder_overflow_drops_.load()) + "/" +
+                    std::to_string(decoder_stall_drops_.load()) + "/" +
+                    std::to_string(decoder_ ? decoder_->corrupt_frames_dropped() : 0) + "/" +
+                    std::to_string(render_late_frames_.load()) + "/" +
+                    std::to_string(rtp_stats.sequence_gaps));
 
     if (pc_)
     {
@@ -349,8 +420,37 @@ VideoPerformanceCounters WebRtcSession::get_video_performance() const {
 }
 
 int WebRtcSession::get_network_rtt_ms() const {
+    return get_network_rtt_stats().current_ms;
+}
+
+NetworkRttStats WebRtcSession::get_network_rtt_stats() const {
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
-    return pc_ ? peer_connection_get_rtt_ms(pc_) : -1;
+    NetworkRttStats result;
+    if (!pc_)
+        return result;
+
+    PeerNetworkRttStats stats {};
+    if (peer_connection_get_rtt_stats(pc_, &stats) != 0)
+        return result;
+
+    result.current_ms = stats.current_ms;
+    result.stun_current_ms = stats.stun_current_ms;
+    result.sctp_current_ms = stats.sctp_current_ms;
+    result.min_ms = stats.min_ms;
+    result.p95_ms = stats.p95_ms;
+    result.jitter_ms = stats.jitter_ms;
+    result.stun_sample_age_ms = stats.stun_sample_age_ms;
+    result.samples = stats.samples;
+    result.probes_sent = stats.probes_sent;
+    result.probes_matched = stats.probes_matched;
+    result.probes_lost = stats.probes_lost;
+    result.probes_unmatched = stats.probes_unmatched;
+    result.probe_in_flight = stats.probe_in_flight != 0;
+    result.source =
+        stats.source == PEER_RTT_SOURCE_STUN ? NetworkRttSource::Stun :
+        stats.source == PEER_RTT_SOURCE_SCTP ? NetworkRttSource::Sctp :
+        NetworkRttSource::None;
+    return result;
 }
 
 StreamNetworkCounters WebRtcSession::get_network_counters() const {
@@ -471,22 +571,44 @@ std::string WebRtcSession::get_debug_info() const {
     result += "\nAU buffers pool/reuse/alloc: " + std::to_string(decode_pool_size) + "/" +
               std::to_string(decoder_buffer_reuses_.load()) + "/" +
               std::to_string(decoder_buffer_allocations_.load());
-    result += "\nRTP packets/gaps/reordered/late/forced: " +
+    result += "\nRTP packets/gaps/reordered/late/forced/startupRebase: " +
               std::to_string(rtp_stats.packets_received) + "/" +
               std::to_string(rtp_stats.sequence_gaps) + "/" +
               std::to_string(rtp_stats.reordered_packets) + "/" +
               std::to_string(rtp_stats.late_packets_dropped) + "/" +
-              std::to_string(rtp_stats.forced_sequence_skips);
+              std::to_string(rtp_stats.forced_sequence_skips) + "/" +
+              std::to_string(rtp_stats.startup_sequence_rebases);
     result += "\nRTP access units ok/dropped: " +
               std::to_string(rtp_stats.access_units_completed) + "/" +
               std::to_string(rtp_stats.access_units_dropped);
-    result += "\nRTCP NACK requests/packets: " +
+    result += "\nRTP adaptive hold/recovered/expired: " +
+              std::to_string(rtp_stats.reorder_adaptive_holds) + "/" +
+              std::to_string(rtp_stats.reorder_gap_recoveries) + "/" +
+              std::to_string(rtp_stats.reorder_gap_expirations);
+    result += "\nRTP grace regular/burst ms: " +
+              std::to_string(rtp_stats.reorder_gap_hold_ms) + "/" +
+              std::to_string(rtp_stats.reorder_burst_gap_hold_ms);
+    result += "\nRTCP NACK requests/packets/retries: " +
               std::to_string(rtp_stats.nack_requests) + "/" +
-              std::to_string(rtp_stats.nack_packets_requested);
+              std::to_string(rtp_stats.nack_packets_requested) + "/" +
+              std::to_string(rtp_stats.nack_retries);
     result += "\nFrame timing drop/overflow/hold: " +
               std::to_string(holder.getTimingDropStat()) + "/" +
               std::to_string(holder.getOverflowDropStat()) + "/" +
               std::to_string(holder.getTimingHoldStat());
+    result += "\nFrame predictive wait/recovered/skipped/producerUs: " +
+              std::to_string(holder.getBriefWaitStat()) + "/" +
+              std::to_string(holder.getBriefWaitRecoveredStat()) + "/" +
+              std::to_string(holder.getPredictiveWaitSkippedStat()) + "/" +
+              std::to_string(holder.getObservedProducerIntervalUs());
+    result += "\nSource pacing rtpPeriod/early/phase/external/bypass/reuseNow/reuseMax: " +
+              std::to_string(holder.getObservedProducerRtpTicks()) + "/" +
+              std::to_string(holder.getPacingEarlyToleranceTicks()) + "/" +
+              std::to_string(holder.getLastPacingPhaseTicks()) + "/" +
+              std::to_string(holder.getSourceClockPresentStat()) + "/" +
+              std::to_string(holder.getClockBypassPresentStat()) + "/" +
+              std::to_string(holder.getCurrentConsecutiveReuse()) + "/" +
+              std::to_string(holder.getMaximumConsecutiveReuse());
     if (audio_) {
         result += "\n" + audio_->debug_info();
         const int64_t target = video_target_rtp_timestamp();

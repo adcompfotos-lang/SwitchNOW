@@ -57,6 +57,29 @@ struct StreamNetworkCounters {
     std::uint32_t nack_requests = 0;
 };
 
+enum class NetworkRttSource {
+    None,
+    Stun,
+    Sctp,
+};
+
+struct NetworkRttStats {
+    int current_ms = -1;
+    int stun_current_ms = -1;
+    int sctp_current_ms = -1;
+    int min_ms = -1;
+    int p95_ms = -1;
+    int jitter_ms = -1;
+    std::uint32_t stun_sample_age_ms = 0;
+    std::uint32_t samples = 0;
+    std::uint32_t probes_sent = 0;
+    std::uint32_t probes_matched = 0;
+    std::uint32_t probes_lost = 0;
+    std::uint32_t probes_unmatched = 0;
+    bool probe_in_flight = false;
+    NetworkRttSource source = NetworkRttSource::None;
+};
+
 class WebRtcSession {
 public:
     WebRtcSession(
@@ -99,6 +122,7 @@ public:
     int64_t video_target_rtp_timestamp() const;
     VideoPerformanceCounters get_video_performance() const;
     int get_network_rtt_ms() const;
+    NetworkRttStats get_network_rtt_stats() const;
     StreamNetworkCounters get_network_counters() const;
     StreamTransportHealth get_transport_health() const;
     std::string get_debug_info() const;
@@ -135,6 +159,8 @@ private:
     bool auto_safe_mode_used_ = false;
     bool nvdec_marker_owned_ = false;
     std::string video_backend_name_ = "uninitialized";
+    std::string decoder_setup_diagnostics_;
+    std::string nvdec_setup_diagnostics_;
     std::thread network_thread_;
     std::atomic<bool> network_running_ {false};
     std::atomic<bool> stop_requested_ {false};
@@ -151,7 +177,9 @@ private:
     };
     std::thread decoder_thread_;
     std::atomic<bool> decoder_running_ {false};
-    std::atomic<bool> decoder_resync_required_ {false};
+    // A newly joined H.264 stream has no reference picture. Dependent P frames
+    // must not reach the decoder until the first IDR establishes that state.
+    std::atomic<bool> decoder_resync_required_ {true};
     std::atomic<bool> decoder_reset_requested_ {false};
     std::atomic<bool> keyframe_needed_ {false};
     mutable std::mutex decoder_queue_mutex_;
@@ -159,11 +187,15 @@ private:
     std::deque<DecodeUnit> decoder_queue_;
     std::deque<std::vector<uint8_t>> decoder_buffer_pool_;
     std::atomic<int> decoder_queue_drops_ {0};
+    std::atomic<uint64_t> decoder_resync_drops_ {0};
+    std::atomic<uint64_t> decoder_overflow_drops_ {0};
+    std::atomic<uint64_t> decoder_stall_drops_ {0};
     std::atomic<uint64_t> decoder_buffer_reuses_ {0};
     std::atomic<uint64_t> decoder_buffer_allocations_ {0};
     std::atomic<uint64_t> transport_batches_ {0};
     std::atomic<uint64_t> transport_datagrams_ {0};
     std::atomic<size_t> transport_batch_high_water_ {0};
+    std::atomic<bool> interactive_input_pending_ {false};
 
     std::string current_state_ = "Initializing";
     std::atomic<int> packets_received_ {0};
@@ -179,6 +211,7 @@ private:
     std::atomic<uint64_t> queue_wait_us_max_ {0};
     std::atomic<uint64_t> render_us_total_ {0};
     std::atomic<uint64_t> render_us_max_ {0};
+    std::atomic<uint64_t> render_late_frames_ {0};
     std::atomic<size_t> decoder_queue_high_water_ {0};
     std::array<std::atomic<uint64_t>, 10> decode_latency_buckets_ {};
     std::array<std::atomic<uint64_t>, 10> queue_wait_buckets_ {};
@@ -250,6 +283,7 @@ private:
     uint32_t video_sr_rtp_timestamp_ = 0;
     bool have_video_sender_report_ = false;
     uint32_t last_rtp_access_units_dropped_ = 0;
+    std::atomic<uint32_t> last_rtp_damage_gate_ {0};
 
     void handle_signaling_message(const std::string& msg);
     void setup_peer_connection();

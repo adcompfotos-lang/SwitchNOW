@@ -93,10 +93,21 @@ typedef struct PeerVideoRtpStats {
   uint32_t late_packets_dropped;
   uint32_t forced_sequence_skips;
   uint32_t reorder_buffered_packets;
+  uint32_t startup_sequence_rebases;
+  uint32_t reorder_gap_hold_ms;
+  uint32_t reorder_burst_gap_hold_ms;
+  uint32_t reorder_adaptive_holds;
+  uint32_t reorder_gap_recoveries;
+  uint32_t reorder_gap_expirations;
+  uint32_t reorder_burst_fast_forwards;
   uint32_t access_units_completed;
   uint32_t access_units_dropped;
   uint32_t nack_requests;
   uint32_t nack_packets_requested;
+  uint32_t nack_retries;
+  uint32_t rtx_packets_received;
+  uint32_t rtx_packets_recovered;
+  uint32_t rtx_packets_invalid;
 } PeerVideoRtpStats;
 
 typedef struct PeerConfiguration {
@@ -134,6 +145,9 @@ void peer_connection_close(PeerConnection* pc);
 
 // Returns 1 when a media/control datagram was consumed, otherwise 0.
 int peer_connection_loop(PeerConnection* pc);
+
+// Drains one already queued datagram without waiting for socket readiness.
+int peer_connection_loop_nonblocking(PeerConnection* pc);
 
 int peer_connection_create_datachannel(PeerConnection* pc, DecpChannelType channel_type, uint16_t priority, uint32_t reliability_parameter, char* label, char* protocol);
 
@@ -235,6 +249,29 @@ typedef struct PeerIceCandidatePairInfo {
   int remote_port;
 } PeerIceCandidatePairInfo;
 
+typedef enum PeerRttSource {
+  PEER_RTT_SOURCE_NONE = 0,
+  PEER_RTT_SOURCE_STUN,
+  PEER_RTT_SOURCE_SCTP,
+} PeerRttSource;
+
+typedef struct PeerNetworkRttStats {
+  int current_ms;
+  int stun_current_ms;
+  int sctp_current_ms;
+  int min_ms;
+  int p95_ms;
+  int jitter_ms;
+  uint32_t stun_sample_age_ms;
+  uint32_t samples;
+  uint32_t probes_sent;
+  uint32_t probes_matched;
+  uint32_t probes_lost;
+  uint32_t probes_unmatched;
+  int probe_in_flight;
+  PeerRttSource source;
+} PeerNetworkRttStats;
+
 int peer_connection_get_ice_candidate_pair_count(PeerConnection* pc);
 
 int peer_connection_get_ice_candidate_pair_info(PeerConnection* pc,
@@ -242,6 +279,9 @@ int peer_connection_get_ice_candidate_pair_info(PeerConnection* pc,
                                                 PeerIceCandidatePairInfo* info);
 
 int peer_connection_get_rtt_ms(PeerConnection* pc);
+
+int peer_connection_get_rtt_stats(PeerConnection* pc,
+                                  PeerNetworkRttStats* stats);
 
 #ifdef __cplusplus
 }

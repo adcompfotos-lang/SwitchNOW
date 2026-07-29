@@ -21,7 +21,7 @@
 
 namespace
 {
-constexpr const char* kSwitchNowVersion = "1.1.0";
+constexpr const char* kSwitchNowVersion = "1.1.5";
 }
 
 #ifdef __SWITCH__

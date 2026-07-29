@@ -339,8 +339,6 @@ void StreamView::StartNteAutoLogin(std::chrono::steady_clock::time_point now) {
     opennow::AppendNteAutoLoginLog(
         "FLOW revision=0.9.4.5 submit=email_enter,password_enter field_clear=ctrl_a_backspace");
     opennow::AppendNteAutoLoginLog("START accepted credentials=present_and_redacted");
-    if (session_)
-        opennow::AppendNteAutoLoginLog("TRANSPORT snapshot\n" + session_->get_debug_info());
     nte_next_action_ = now;
     nte_status_ = "NTE Auto-login: opening email sign-in";
     nte_status_until_ = now + std::chrono::seconds(20);
@@ -912,22 +910,23 @@ void StreamView::UpdatePerformanceCounter(const VideoPerformanceCounters& counte
 }
 
 void StreamView::DrawPerformanceOverlay(NVGcontext* vg, float x, float y) {
-    char text[112];
-    const int network_rtt_ms = session_ ? session_->get_network_rtt_ms() : -1;
-    if (network_rtt_ms >= 0) {
+    char text[224];
+    const NetworkRttStats rtt = session_ ? session_->get_network_rtt_stats() : NetworkRttStats {};
+    if (rtt.current_ms >= 0) {
         std::snprintf(text, sizeof(text),
-            "IN %.0f  DEC %.0f  OUT %.0f  |  RTT %d ms",
-            incoming_fps_, decoded_fps_, presented_fps_, network_rtt_ms);
+            "IN %.0f  DEC %.0f  OUT %.0f  |  RTT %d  MIN %d  P95 %d  JIT %d ms",
+            incoming_fps_, decoded_fps_, presented_fps_, rtt.current_ms,
+            rtt.min_ms, rtt.p95_ms, rtt.jitter_ms);
     } else {
         std::snprintf(text, sizeof(text),
-            "IN %.0f  DEC %.0f  OUT %.0f  |  RTT --",
+            "IN %.0f  DEC %.0f  OUT %.0f  |  RTT --  MIN --  P95 --  JIT --",
             incoming_fps_, decoded_fps_, presented_fps_);
     }
 
     const float box_x = x + 16.0f;
     const float box_y = y + 16.0f;
     nvgBeginPath(vg);
-    nvgRoundedRect(vg, box_x, box_y, 430.0f, 42.0f, 8.0f);
+    nvgRoundedRect(vg, box_x, box_y, 700.0f, 42.0f, 8.0f);
     nvgFillColor(vg, nvgRGBA(8, 12, 14, 205));
     nvgFill(vg);
 
@@ -936,7 +935,7 @@ void StreamView::DrawPerformanceOverlay(NVGcontext* vg, float x, float y) {
     nvgFillColor(vg, nvgRGB(55, 220, 125));
     nvgFill(vg);
 
-    nvgFontSize(vg, 24.0f);
+    nvgFontSize(vg, 20.0f);
     nvgFontFaceId(vg, brls::Application::getFont(brls::FONT_REGULAR));
     nvgFillColor(vg, nvgRGB(245, 250, 247));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
@@ -1197,7 +1196,6 @@ void StreamView::DrawSessionLimitNotice(
 
 void StreamView::draw(NVGcontext* vg, float x, float y, float width, float height, brls::Style style, brls::FrameContext* ctx) {
     if (session_) {
-        session_->poll();
         UpdateInlineKeyboard();
 
         const auto stream_now = std::chrono::steady_clock::now();
@@ -1447,6 +1445,10 @@ void StreamView::draw(NVGcontext* vg, float x, float y, float width, float heigh
         }
         touch_was_down_ = touch_down;
         }
+
+        // Submit this frame's interactive input before signaling upkeep and
+        // diagnostics so housekeeping cannot delay a fresh controller report.
+        session_->poll();
     }
     
     // Basic drawing logic - if we have a frame, we draw it using GLVideoRenderer

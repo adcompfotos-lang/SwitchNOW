@@ -4,9 +4,79 @@
 #include <cctype>
 #include <limits>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace opennow::server_location
 {
+
+struct LatencyEstimate
+{
+    int median_ms = -1;
+    int jitter_ms = -1;
+    int selection_score_ms = -1;
+    int successful_probes = 0;
+};
+
+inline LatencyEstimate EstimateLatency(
+    std::vector<int> samples,
+    int attempted_probes)
+{
+    samples.erase(
+        std::remove_if(samples.begin(), samples.end(), [](int value) {
+            return value < 0;
+        }),
+        samples.end());
+    if (samples.empty())
+        return {};
+
+    std::sort(samples.begin(), samples.end());
+    const size_t count = samples.size();
+    const int median = count % 2 == 0
+        ? (samples[count / 2 - 1] + samples[count / 2] + 1) / 2
+        : samples[count / 2];
+
+    // Use the inner spread when enough probes succeeded so a single scheduler
+    // spike cannot incorrectly disqualify an otherwise nearby region.
+    const size_t low_index = count >= 4 ? (count - 1) / 4 : 0;
+    const size_t high_index = count >= 4 ? (3 * (count - 1)) / 4 : count - 1;
+    const int jitter = samples[high_index] - samples[low_index];
+    const int failed = std::max(0, attempted_probes - static_cast<int>(count));
+    const int sparse_sample_penalty = count == 1 ? 100 : 0;
+    const int stability_penalty = std::min(75, (jitter + 1) / 2);
+
+    return {
+        median,
+        jitter,
+        median + stability_penalty + failed * 20 + sparse_sample_penalty,
+        static_cast<int>(count),
+    };
+}
+
+template <typename Region, typename = void>
+struct HasSelectionScore : std::false_type
+{
+};
+
+template <typename Region>
+struct HasSelectionScore<
+    Region,
+    std::void_t<decltype(std::declval<const Region&>().selection_score_ms)>>
+    : std::true_type
+{
+};
+
+template <typename Region>
+int RegionSelectionScore(const Region& region)
+{
+    if constexpr (HasSelectionScore<Region>::value)
+    {
+        if (region.selection_score_ms >= 0)
+            return region.selection_score_ms;
+    }
+    return region.ping_ms;
+}
 
 inline bool IsAutomatic(const std::string& value)
 {
@@ -41,18 +111,19 @@ inline std::string NormalizeStreamingBaseUrl(std::string value)
 template <typename RegionRange>
 std::string SelectBestMeasuredRegionUrl(const RegionRange& regions)
 {
-    int best_ping_ms = std::numeric_limits<int>::max();
+    int best_score_ms = std::numeric_limits<int>::max();
     std::string best_url;
     for (const auto& region : regions)
     {
-        if (region.ping_ms < 0 || region.ping_ms >= best_ping_ms)
+        const int score_ms = RegionSelectionScore(region);
+        if (region.ping_ms < 0 || score_ms < 0 || score_ms >= best_score_ms)
             continue;
 
         const std::string normalized = NormalizeStreamingBaseUrl(region.url);
         if (normalized.empty())
             continue;
 
-        best_ping_ms = region.ping_ms;
+        best_score_ms = score_ms;
         best_url = normalized;
     }
     return best_url;

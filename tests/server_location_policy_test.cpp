@@ -10,6 +10,7 @@ struct RegionCandidate
 {
     std::string url;
     int ping_ms;
+    int selection_score_ms = -1;
 };
 }
 
@@ -59,9 +60,28 @@ int main()
     assert(
         SelectBestMeasuredRegionUrl(regions) ==
         "https://np-ams.example/");
+    const std::vector<RegionCandidate> unavailable_regions = {
+        {"https://np-par.example", -1},
+    };
+    assert(SelectBestMeasuredRegionUrl(unavailable_regions).empty());
+
+    const auto stable = EstimateLatency({38, 39, 40, 41, 42}, 5);
+    assert(stable.median_ms == 40);
+    assert(stable.jitter_ms == 2);
+    assert(stable.selection_score_ms == 41);
+    assert(stable.successful_probes == 5);
+
+    const auto incomplete = EstimateLatency({28, -1, 32, -1, 30}, 5);
+    assert(incomplete.median_ms == 30);
+    assert(incomplete.successful_probes == 3);
+    assert(incomplete.selection_score_ms > stable.selection_score_ms);
+
+    const std::vector<RegionCandidate> scored_regions = {
+        {"https://fast-but-unstable.example", 28, 80},
+        {"https://stable.example", 38, 40},
+    };
     assert(
-        SelectBestMeasuredRegionUrl(std::vector<RegionCandidate> {
-            {"https://np-par.example", -1},
-        }).empty());
+        SelectBestMeasuredRegionUrl(scored_regions) ==
+        "https://stable.example/");
     return 0;
 }

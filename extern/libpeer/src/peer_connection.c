@@ -13,6 +13,7 @@
 #include "ports.h"
 #include "rtcp.h"
 #include "rtp.h"
+#include "rtp_recovery.h"
 #include "sctp.h"
 #include "sdp.h"
 
@@ -51,10 +52,21 @@ struct PeerConnection {
 
   uint32_t remote_assrc;
   uint32_t remote_vssrc;
-  uint16_t video_last_sequence;
-  int video_has_last_sequence;
+  uint32_t remote_vrtx_ssrc;
+  int video_payload_type;
+  int video_rtx_payload_type;
+  uint16_t video_last_nack_sequence;
+  uint16_t video_last_nack_bitmask;
+  int video_has_last_nack_sequence;
+  uint8_t video_nack_retry_count;
+  uint8_t video_nack_burst;
+  uint32_t video_last_nack_sent_ms;
   uint32_t video_nack_requests;
   uint32_t video_nack_packets_requested;
+  uint32_t video_nack_retries;
+  uint32_t video_rtx_packets_received;
+  uint32_t video_rtx_packets_recovered;
+  uint32_t video_rtx_packets_invalid;
 
   int dtls_handshake_attempts;
   uint32_t dtls_handshake_started_ms;
@@ -71,6 +83,7 @@ struct PeerConnection {
 
 static int peer_connection_send_rtcp_nack(PeerConnection* pc, uint32_t ssrc,
                                           uint16_t packet_id, uint16_t bitmask);
+static void peer_connection_maybe_send_video_nack(PeerConnection* pc);
 
 static void peer_connection_diag_log(const char* fmt, ...) {
   FILE* file = fopen("sdmc:/switch/OpenNOWSwitch/signaling.log", "a");
@@ -266,6 +279,8 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   memcpy(&pc->config, config, sizeof(PeerConfiguration));
   pc->state = PEER_CONNECTION_NEW;
+  pc->video_payload_type = PT_H264;
+  pc->video_rtx_payload_type = -1;
 
   agent_create(&pc->agent);
 
@@ -410,7 +425,8 @@ static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
   return d == DTLS_SRTP_ROLE_SERVER ? "a=setup:passive" : "a=setup:active";
 }
 
-int peer_connection_loop(PeerConnection* pc) {
+static int peer_connection_loop_internal(PeerConnection* pc,
+                                         int completed_poll_timeout_ms) {
   uint32_t ssrc = 0;
   int packet_processed = 0;
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
@@ -488,7 +504,9 @@ int peer_connection_loop(PeerConnection* pc) {
       }
       break;
     case PEER_CONNECTION_COMPLETED:
-      if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
+      if ((pc->agent_ret = agent_recv_timeout(&pc->agent, pc->agent_buf,
+                                              sizeof(pc->agent_buf),
+                                              completed_poll_timeout_ms)) > 0) {
         packet_processed = 1;
         LOGD("agent_recv %d", pc->agent_ret);
         pc->completed_udp_packets++;
@@ -567,6 +585,20 @@ int peer_connection_loop(PeerConnection* pc) {
 
           ssrc = rtp_get_ssrc(pc->agent_buf);
           RtpPacket* rtp = (RtpPacket*)pc->agent_buf;
+          const uint32_t regular_gap_hold_ms =
+              rtp_recovery_gap_hold_ms(pc->agent.rtt_current_ms,
+                                       pc->agent.rtt_jitter_q4 / 4u);
+          const uint32_t startup_gap_hold_ms =
+              rtp_recovery_startup_gap_hold_ms(
+                  regular_gap_hold_ms,
+                  pc->vrtp_decoder.access_units_completed);
+          rtp_decoder_set_reorder_grace_ms(
+              &pc->vrtp_decoder, startup_gap_hold_ms);
+          rtp_decoder_set_reorder_burst_grace_ms(
+              &pc->vrtp_decoder,
+              rtp_recovery_burst_gap_hold_ms(
+                  startup_gap_hold_ms, pc->agent.rtt_current_ms,
+                  pc->agent.rtt_jitter_q4 / 4u));
           const int is_audio_payload = rtp->header.type == PT_PCMU ||
                                        rtp->header.type == PT_PCMA ||
                                        rtp->header.type == PT_OPUS ||
@@ -579,6 +611,32 @@ int peer_connection_loop(PeerConnection* pc) {
                                        pc->remote_assrc, rtp->header.type);
             }
             rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
+          } else if (pc->remote_vrtx_ssrc != 0 &&
+                     ssrc == pc->remote_vrtx_ssrc &&
+                     pc->video_rtx_payload_type >= 0 &&
+                     rtp->header.type == (uint8_t)pc->video_rtx_payload_type) {
+            pc->video_rtx_packets_received++;
+            size_t recovered_size = (size_t)pc->agent_ret;
+            if (rtp_packet_unwrap_rtx(pc->agent_buf, &recovered_size,
+                                      (uint8_t)pc->video_payload_type,
+                                      pc->remote_vssrc) == 0) {
+              pc->agent_ret = (int)recovered_size;
+              pc->video_rtx_packets_recovered++;
+              rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf,
+                                 pc->agent_ret);
+            } else {
+              pc->video_rtx_packets_invalid++;
+            }
+            if (pc->video_rtx_packets_received <= 4 ||
+                pc->video_rtx_packets_received % 600 == 0) {
+              peer_connection_diag_log(
+                  "rtx received/recovered/invalid=%u/%u/%u pt=%d ssrc=%" PRIu32,
+                  pc->video_rtx_packets_received,
+                  pc->video_rtx_packets_recovered,
+                  pc->video_rtx_packets_invalid,
+                  pc->video_rtx_payload_type,
+                  pc->remote_vrtx_ssrc);
+            }
           } else if (ssrc == pc->remote_vssrc ||
                      (pc->remote_vssrc == 0 &&
                       rtp->header.type != PT_PCMU &&
@@ -589,41 +647,29 @@ int peer_connection_loop(PeerConnection* pc) {
               pc->remote_vssrc = ssrc;
               LOGI("Learned remote video SSRC from RTP: %" PRIu32, pc->remote_vssrc);
             }
-            const uint16_t sequence =
-                (uint16_t)(((uint16_t)pc->agent_buf[2] << 8) | pc->agent_buf[3]);
-            if (pc->video_has_last_sequence) {
-              const uint16_t expected = (uint16_t)(pc->video_last_sequence + 1);
-              const int16_t missing = (int16_t)(sequence - expected);
-              if (missing > 0) {
-                const int requested = missing > 17 ? 17 : missing;
-                const uint16_t bitmask = requested > 1
-                    ? (uint16_t)((1u << (requested - 1)) - 1u) : 0;
-                (void)peer_connection_send_rtcp_nack(
-                    pc, pc->remote_vssrc, expected, bitmask);
-                pc->video_nack_requests++;
-                pc->video_nack_packets_requested += (uint32_t)requested;
-              }
-              if (missing >= 0)
-                pc->video_last_sequence = sequence;
-            } else {
-              pc->video_has_last_sequence = 1;
-              pc->video_last_sequence = sequence;
-            }
             rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
             if (pc->completed_rtp_packets % 6000 == 0) {
               peer_connection_diag_log(
-                  "rtp_h264 packets=%u gaps=%u reordered=%u late=%u forced=%u buffered=%u nalus=%u auOk=%u auDrop=%u",
+                  "rtp_h264 packets=%u gaps=%u reordered=%u late=%u forced=%u startupRebase=%u buffered=%u adaptiveHold/recovered/expired/fastForward=%u/%u/%u/%u nack/retry=%u/%u nalus=%u auOk=%u auDrop=%u",
                   pc->vrtp_decoder.packets_received,
                   pc->vrtp_decoder.sequence_gaps,
                   pc->vrtp_decoder.reordered_packets,
                   pc->vrtp_decoder.late_packets_dropped,
                   pc->vrtp_decoder.forced_sequence_skips,
+                  pc->vrtp_decoder.startup_sequence_rebases,
                   pc->vrtp_decoder.reorder_buffered_packets,
+                  pc->vrtp_decoder.reorder_adaptive_holds,
+                  pc->vrtp_decoder.reorder_gap_recoveries,
+                  pc->vrtp_decoder.reorder_gap_expirations,
+                  pc->vrtp_decoder.reorder_burst_fast_forwards,
+                  pc->video_nack_requests,
+                  pc->video_nack_retries,
                   pc->vrtp_decoder.nal_units_completed,
                   pc->vrtp_decoder.access_units_completed,
                   pc->vrtp_decoder.access_units_dropped);
             }
           }
+          peer_connection_maybe_send_video_nack(pc);
 
         } else {
           pc->completed_unknown_packets++;
@@ -641,6 +687,8 @@ int peer_connection_loop(PeerConnection* pc) {
           LOGW("Unknown data");
         }
       }
+
+      agent_rtt_probe_tick(&pc->agent);
 
       if (CONFIG_KEEPALIVE_TIMEOUT > 0 &&
           pc->agent.binding_request_time > 0 &&
@@ -661,6 +709,14 @@ int peer_connection_loop(PeerConnection* pc) {
   }
 
   return packet_processed;
+}
+
+int peer_connection_loop(PeerConnection* pc) {
+  return peer_connection_loop_internal(pc, 1);
+}
+
+int peer_connection_loop_nonblocking(PeerConnection* pc) {
+  return peer_connection_loop_internal(pc, 0);
 }
 
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType type) {
@@ -714,6 +770,26 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
                                  ssrc == &pc->remote_vssrc ? "video" : "audio",
                                  *ssrc,
                                  parsed_ssrc);
+      }
+    }
+
+    if (ssrc == &pc->remote_vssrc &&
+        sscanf(buf, "a=ssrc-group:FID %" SCNu32 " %" SCNu32,
+               &pc->remote_vssrc, &pc->remote_vrtx_ssrc) == 2) {
+      peer_connection_diag_log(
+          "remote_video_fid primary=%" PRIu32 " rtx=%" PRIu32,
+          pc->remote_vssrc, pc->remote_vrtx_ssrc);
+    }
+
+    if (ssrc == &pc->remote_vssrc && strstr(buf, "a=fmtp:")) {
+      int rtx_pt = -1;
+      int apt = -1;
+      if (sscanf(buf, "a=fmtp:%d apt=%d", &rtx_pt, &apt) == 2 &&
+          apt == PT_H264) {
+        pc->video_payload_type = apt;
+        pc->video_rtx_payload_type = rtx_pt;
+        peer_connection_diag_log("remote_video_rtx_mapping mediaPt=%d rtxPt=%d",
+                                 apt, rtx_pt);
       }
     }
 
@@ -860,6 +936,86 @@ static int peer_connection_send_rtcp_nack(PeerConnection* pc, uint32_t ssrc,
   return agent_send(&pc->agent, nackbuf, size);
 }
 
+static uint32_t peer_connection_nack_packet_count(uint16_t bitmask) {
+  uint32_t count = 1;
+  while (bitmask != 0) {
+    count += bitmask & 1u;
+    bitmask >>= 1u;
+  }
+  return count;
+}
+
+static void peer_connection_reset_video_nack(PeerConnection* pc) {
+  pc->video_has_last_nack_sequence = 0;
+  pc->video_last_nack_bitmask = 0;
+  pc->video_nack_retry_count = 0;
+  pc->video_nack_burst = 0;
+  pc->video_last_nack_sent_ms = 0;
+}
+
+static void peer_connection_maybe_send_video_nack(PeerConnection* pc) {
+  uint16_t packet_id = 0;
+  uint16_t bitmask = 0;
+  if (!pc || pc->remote_vssrc == 0 ||
+      !rtp_decoder_get_nack(&pc->vrtp_decoder, &packet_id, &bitmask)) {
+    if (pc)
+      peer_connection_reset_video_nack(pc);
+    return;
+  }
+
+  const uint32_t now_ms = ports_get_epoch_time();
+  const uint32_t retry_interval_ms =
+      rtp_recovery_nack_retry_ms(pc->agent.rtt_current_ms);
+  const int new_base = !pc->video_has_last_nack_sequence ||
+                       pc->video_last_nack_sequence != packet_id;
+  const int expanded_mask =
+      !new_base && pc->video_last_nack_bitmask != bitmask;
+
+  if (new_base) {
+    pc->video_last_nack_sequence = packet_id;
+    pc->video_last_nack_bitmask = bitmask;
+    pc->video_nack_retry_count = 0;
+  } else if (expanded_mask) {
+    pc->video_last_nack_bitmask = bitmask;
+  }
+  if (pc->vrtp_decoder.reorder_buffered_packets >=
+      RTP_RECOVERY_BURST_GAP_DISTANCE) {
+    pc->video_nack_burst = 1;
+  }
+
+  const uint32_t elapsed_ms =
+      pc->video_last_nack_sent_ms == 0
+          ? retry_interval_ms
+          : now_ms - pc->video_last_nack_sent_ms;
+  const int first_request = new_base || !pc->video_has_last_nack_sequence;
+  const int mask_update_ready =
+      expanded_mask && elapsed_ms >= RTP_RECOVERY_MIN_NACK_RETRY_MS;
+  const int retry_ready =
+      !first_request && !mask_update_ready &&
+      pc->video_nack_retry_count <
+          (pc->video_nack_burst
+               ? RTP_RECOVERY_MAX_BURST_NACK_RETRIES
+               : RTP_RECOVERY_MAX_NACK_RETRIES) &&
+      elapsed_ms >= retry_interval_ms;
+  if (!first_request && !mask_update_ready && !retry_ready)
+    return;
+
+  const int sent = peer_connection_send_rtcp_nack(
+      pc, pc->remote_vssrc, packet_id, pc->video_last_nack_bitmask);
+  if (sent < 0)
+    return;
+
+  if (!first_request) {
+    pc->video_nack_retry_count++;
+    pc->video_nack_retries++;
+  }
+  pc->video_has_last_nack_sequence = 1;
+  pc->video_last_nack_sent_ms = now_ms;
+  pc->video_nack_requests++;
+  pc->video_nack_packets_requested +=
+      peer_connection_nack_packet_count(pc->video_last_nack_bitmask);
+}
+
 int peer_connection_request_video_keyframe(PeerConnection* pc) {
   if (!pc)
     return -1;
@@ -976,11 +1132,57 @@ int peer_connection_get_ice_candidate_pair_stats(PeerConnection* pc,
 }
 
 int peer_connection_get_rtt_ms(PeerConnection* pc) {
-  if (!pc)
-    return -1;
+  PeerNetworkRttStats stats;
+  return peer_connection_get_rtt_stats(pc, &stats) == 0
+             ? stats.current_ms
+             : -1;
+}
 
-  const int ice_rtt_ms = agent_get_rtt_ms(&pc->agent);
-  return ice_rtt_ms >= 0 ? ice_rtt_ms : sctp_get_rtt_ms(&pc->sctp);
+int peer_connection_get_rtt_stats(PeerConnection* pc,
+                                  PeerNetworkRttStats* stats) {
+  AgentRttStats stun_stats;
+  int sctp_rtt_ms;
+  if (!pc || !stats) {
+    return -1;
+  }
+
+  memset(stats, 0, sizeof(*stats));
+  stats->current_ms = -1;
+  stats->stun_current_ms = -1;
+  stats->sctp_current_ms = -1;
+  stats->min_ms = -1;
+  stats->p95_ms = -1;
+  stats->jitter_ms = -1;
+  stats->source = PEER_RTT_SOURCE_NONE;
+
+  agent_get_rtt_stats(&pc->agent, &stun_stats);
+  sctp_rtt_ms = sctp_get_rtt_ms(&pc->sctp);
+  stats->stun_current_ms = stun_stats.current_ms;
+  stats->sctp_current_ms = sctp_rtt_ms;
+  stats->min_ms = stun_stats.min_ms;
+  stats->p95_ms = stun_stats.p95_ms;
+  stats->jitter_ms = stun_stats.jitter_ms;
+  stats->stun_sample_age_ms = stun_stats.sample_age_ms;
+  stats->samples = stun_stats.samples;
+  stats->probes_sent = stun_stats.probes_sent;
+  stats->probes_matched = stun_stats.probes_matched;
+  stats->probes_lost = stun_stats.probes_lost;
+  stats->probes_unmatched = stun_stats.probes_unmatched;
+  stats->probe_in_flight = stun_stats.probe_in_flight;
+
+  // A recent matched STUN response measures the selected media path directly.
+  // If probes are delayed or lost, SCTP SRTT keeps the displayed value live.
+  if (stun_stats.current_ms >= 0 && stun_stats.sample_age_ms <= 1500) {
+    stats->current_ms = stun_stats.current_ms;
+    stats->source = PEER_RTT_SOURCE_STUN;
+  } else if (sctp_rtt_ms >= 0) {
+    stats->current_ms = sctp_rtt_ms;
+    stats->source = PEER_RTT_SOURCE_SCTP;
+  } else if (stun_stats.current_ms >= 0) {
+    stats->current_ms = stun_stats.current_ms;
+    stats->source = PEER_RTT_SOURCE_STUN;
+  }
+  return 0;
 }
 
 int peer_connection_get_ice_candidate_pair_count(PeerConnection* pc) {
@@ -1023,9 +1225,22 @@ int peer_connection_get_video_rtp_stats(PeerConnection* pc, PeerVideoRtpStats* s
   stats->late_packets_dropped = pc->vrtp_decoder.late_packets_dropped;
   stats->forced_sequence_skips = pc->vrtp_decoder.forced_sequence_skips;
   stats->reorder_buffered_packets = pc->vrtp_decoder.reorder_buffered_packets;
+  stats->startup_sequence_rebases = pc->vrtp_decoder.startup_sequence_rebases;
+  stats->reorder_gap_hold_ms = pc->vrtp_decoder.reorder_gap_hold_ms;
+  stats->reorder_burst_gap_hold_ms =
+      pc->vrtp_decoder.reorder_burst_gap_hold_ms;
+  stats->reorder_adaptive_holds = pc->vrtp_decoder.reorder_adaptive_holds;
+  stats->reorder_gap_recoveries = pc->vrtp_decoder.reorder_gap_recoveries;
+  stats->reorder_gap_expirations = pc->vrtp_decoder.reorder_gap_expirations;
+  stats->reorder_burst_fast_forwards =
+      pc->vrtp_decoder.reorder_burst_fast_forwards;
   stats->access_units_completed = pc->vrtp_decoder.access_units_completed;
   stats->access_units_dropped = pc->vrtp_decoder.access_units_dropped;
   stats->nack_requests = pc->video_nack_requests;
   stats->nack_packets_requested = pc->video_nack_packets_requested;
+  stats->nack_retries = pc->video_nack_retries;
+  stats->rtx_packets_received = pc->video_rtx_packets_received;
+  stats->rtx_packets_recovered = pc->video_rtx_packets_recovered;
+  stats->rtx_packets_invalid = pc->video_rtx_packets_invalid;
   return 0;
 }

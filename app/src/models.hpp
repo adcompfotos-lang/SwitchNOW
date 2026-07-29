@@ -122,6 +122,9 @@ struct StreamRegion
     std::string name;
     std::string url;
     int ping_ms = -1;
+    int jitter_ms = -1;
+    int selection_score_ms = -1;
+    int successful_probes = 0;
 };
 
 struct SessionInfo

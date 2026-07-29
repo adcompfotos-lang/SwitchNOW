@@ -1,18 +1,26 @@
 SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& launch_app_id,
                                     const std::string& launch_store,
-                                    const std::string& internal_title) const
+                                    const std::string& internal_title,
+                                    bool force_provider_endpoint) const
 {
     session = EnsureFreshSavedSession(session);
     std::string jwt_token = ResolveSessionJwt(session);
     const std::string device_id = device_id_;
 
     const StreamSettings stream_settings = LoadStreamSettings();
-    ResetSessionTraceLog("StartSession appId=" + launch_app_id +
-                         " store=" + (launch_store.empty() ? "unknown" : launch_store) +
-                         " internalTitle=" + (internal_title.empty() ? "missing" : internal_title));
+    const std::string trace_heading =
+        "StartSession appId=" + launch_app_id +
+        " store=" + (launch_store.empty() ? "unknown" : launch_store) +
+        " internalTitle=" +
+        (internal_title.empty() ? "missing" : internal_title);
+    if (force_provider_endpoint)
+        AppendSessionTraceLog("START provider fallback begin " + trace_heading);
+    else
+        ResetSessionTraceLog(trace_heading);
 
     std::string automatic_region_url;
-    if (server_location::IsAutomatic(stream_settings.region))
+    if (server_location::IsAutomatic(stream_settings.region) &&
+        !force_provider_endpoint)
     {
         const std::string provider_url =
             server_location::NormalizeStreamingBaseUrl(
@@ -27,6 +35,12 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
             {
                 automatic_region_url =
                     g_region_selection_cache.selected_url;
+                AppendSessionTraceLog(
+                    "REGION automatic cache hit ageMs=" +
+                    std::to_string(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            age).count()) +
+                    " selected=" + automatic_region_url);
             }
         }
 
@@ -36,8 +50,25 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
             {
                 const std::vector<StreamRegion> measured =
                     MeasureStreamRegionLatencies(FetchStreamRegions(session));
+                for (const StreamRegion& region : measured)
+                {
+                    AppendSessionTraceLog(
+                        "REGION candidate name=" + region.name +
+                        " tcpEstimateMs=" + std::to_string(region.ping_ms) +
+                        " jitterMs=" + std::to_string(region.jitter_ms) +
+                        " scoreMs=" +
+                        std::to_string(region.selection_score_ms) +
+                        " probes=" +
+                        std::to_string(region.successful_probes) + "/5" +
+                        " url=" + region.url);
+                }
                 automatic_region_url =
                     server_location::SelectBestMeasuredRegionUrl(measured);
+                AppendSessionTraceLog(
+                    "REGION automatic selected=" +
+                    (automatic_region_url.empty()
+                         ? std::string("provider-default")
+                         : automatic_region_url));
 
                 if (!automatic_region_url.empty())
                 {
@@ -96,6 +127,7 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
     AppendSessionTraceLog(
         "START region=" + stream_settings.region +
         " resolvedBase=" + streaming_base_url +
+        (force_provider_endpoint ? " fallback=provider-endpoint" : "") +
         (automatic_region_url.empty()
              ? ""
              : " measuredBest=" + automatic_region_url));
@@ -267,6 +299,54 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
     }
 
     const bool app_patching = root && IsAppPatchingResponse(root.get());
+    json_t* request_status =
+        root ? json_object_get(root.get(), "requestStatus") : nullptr;
+    const int request_status_code =
+        request_status ? GetInteger(request_status, "statusCode") : 0;
+    const std::string request_status_description =
+        request_status ? GetString(request_status, "statusDescription") : "";
+    const std::string provider_base_url =
+        server_location::NormalizeStreamingBaseUrl(
+            session.provider.streaming_service_url);
+    const bool automatic_direct_endpoint =
+        server_location::IsAutomatic(LoadStreamSettings().region) &&
+        !active_base_url.empty() &&
+        !provider_base_url.empty() &&
+        server_location::NormalizeStreamingBaseUrl(active_base_url) !=
+            provider_base_url;
+    const bool invalid_session_id =
+        request_status_code == 22 &&
+        request_status_description.find(
+            "INVALID_SESSION_ID_NOT_FOUND") != std::string::npos;
+    if (invalid_session_id && automatic_direct_endpoint)
+    {
+        const std::string error =
+            BuildCloudMatchErrorMessage(
+                "PollSession", response.status_code, root.get());
+        {
+            std::lock_guard<std::mutex> lock(
+                g_region_selection_cache.mutex);
+            g_region_selection_cache.provider_url = provider_base_url;
+            g_region_selection_cache.selected_url = provider_base_url;
+            g_region_selection_cache.measured_at =
+                std::chrono::steady_clock::now();
+        }
+        AppendSessionTraceLog(
+            "POLL automatic region lost session; provider fallback requested "
+            "and cached for this provider: " +
+            error);
+        throw AutomaticRegionSessionLost(error);
+    }
+    if (invalid_session_id)
+    {
+        const std::string error =
+            BuildCloudMatchErrorMessage(
+                "PollSession", response.status_code, root.get());
+        AppendSessionTraceLog(
+            "POLL session no longer exists at provider endpoint: " +
+            error);
+        throw CloudSessionNotFound(error);
+    }
     if (root)
     {
         json_t* req_status = json_object_get(root.get(), "requestStatus");

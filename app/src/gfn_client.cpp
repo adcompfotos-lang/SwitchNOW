@@ -97,7 +97,7 @@ struct RegionSelectionCache
 };
 
 RegionSelectionCache g_region_selection_cache;
-constexpr auto kRegionSelectionCacheLifetime = std::chrono::minutes(15);
+constexpr auto kRegionSelectionCacheLifetime = std::chrono::minutes(5);
 
 std::string Trim(const std::string& value)
 {
@@ -1184,29 +1184,32 @@ std::vector<std::string> BuildGfnLcarsHeaders(
     return headers;
 }
 
-int MeasureAverageLatency(const HttpClient& http_client, const std::string& url)
+server_location::LatencyEstimate MeasureRegionLatency(
+    const HttpClient& http_client,
+    const std::string& url)
 {
-    // Ignore the first connect so DNS and TLS setup do not bias the selected region.
-    (void)http_client.MeasureConnectLatencyMs(url);
+    constexpr int kProbeCount = 5;
+    constexpr long kProbeTimeoutMs = 1500;
 
-    int total_ms = 0;
-    int successful = 0;
-    for (int attempt = 0; attempt < 3; ++attempt)
+    // Warm DNS once, then use fresh TCP connections for every scored probe.
+    (void)http_client.MeasureTcpHandshakeLatencyMs(url, kProbeTimeoutMs);
+
+    std::vector<int> samples;
+    samples.reserve(kProbeCount);
+    for (int attempt = 0; attempt < kProbeCount; ++attempt)
     {
         if (attempt > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
 
-        const int ping_ms = http_client.MeasureConnectLatencyMs(url);
+        const int ping_ms =
+            http_client.MeasureTcpHandshakeLatencyMs(url, kProbeTimeoutMs);
         if (ping_ms >= 0)
-        {
-            total_ms += ping_ms;
-            ++successful;
-        }
+            samples.push_back(ping_ms);
     }
 
-    return successful == 0
-        ? -1
-        : static_cast<int>((total_ms + successful / 2) / successful);
+    return server_location::EstimateLatency(
+        std::move(samples),
+        kProbeCount);
 }
 
 std::vector<std::string> BuildGraphQlHeaders(const std::string& token)

@@ -737,7 +737,7 @@ void SettingsTab::BuildInterfacePage()
     content_container_->addView(language);
 
     auto* about = MakeSection("SwitchNOW", "Native GeForce NOW client for Nintendo Switch.");
-    AddInfoLine(about, "Version", "1.1.0");
+    AddInfoLine(about, "Version", "1.1.5");
     AddInfoLine(about, "Languages", "English + 7");
     content_container_->addView(about);
 }
@@ -1082,7 +1082,7 @@ std::string SettingsTab::ServerLocationValue() const
     {
         if (best == server_locations_.end())
             return Tr("Auto (best)");
-        return Tr("Auto") + " - " + best->name + " - " +
+        return Tr("Auto") + " - " + best->name + " - ~" +
             std::to_string(best->ping_ms) + " ms";
     }
 
@@ -1097,7 +1097,7 @@ std::string SettingsTab::ServerLocationValue() const
 
     std::string value = selected->name;
     if (selected->ping_ms >= 0)
-        value += " - " + std::to_string(selected->ping_ms) + " ms";
+        value += " - ~" + std::to_string(selected->ping_ms) + " ms";
     return value;
 }
 
@@ -1151,8 +1151,12 @@ void SettingsTab::BeginServerLocationLoad(
                         const bool right_ok = right.ping_ms >= 0;
                         if (left_ok != right_ok)
                             return left_ok;
-                        if (left_ok && left.ping_ms != right.ping_ms)
-                            return left.ping_ms < right.ping_ms;
+                        const int left_score =
+                            server_location::RegionSelectionScore(left);
+                        const int right_score =
+                            server_location::RegionSelectionScore(right);
+                        if (left_ok && left_score != right_score)
+                            return left_score < right_score;
                         return left.name < right.name;
                     });
 
@@ -1272,7 +1276,7 @@ bool SettingsTab::ChooseServerLocation(brls::View* view)
     if (best != server_locations_.end())
     {
         automatic += " - " + best->name + " - " +
-            std::to_string(best->ping_ms) + " ms";
+            "~" + std::to_string(best->ping_ms) + " ms";
     }
     labels.push_back(std::move(automatic));
 
@@ -1282,7 +1286,7 @@ bool SettingsTab::ChooseServerLocation(brls::View* view)
         const StreamRegion& region = options[index];
         std::string label = region.name;
         if (region.ping_ms >= 0)
-            label += " - " + std::to_string(region.ping_ms) + " ms";
+            label += " - ~" + std::to_string(region.ping_ms) + " ms";
         else
             label += " - " + Tr("Unavailable");
         if (best != server_locations_.end() && region.url == best->url)

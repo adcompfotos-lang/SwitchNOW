@@ -82,8 +82,14 @@ std::vector<StreamRegion> GfnClient::MeasureStreamRegionLatencies(
                 if (index >= regions.size())
                     return;
 
-                regions[index].ping_ms =
-                    MeasureAverageLatency(http_client_, regions[index].url);
+                const server_location::LatencyEstimate estimate =
+                    MeasureRegionLatency(http_client_, regions[index].url);
+                regions[index].ping_ms = estimate.median_ms;
+                regions[index].jitter_ms = estimate.jitter_ms;
+                regions[index].selection_score_ms =
+                    estimate.selection_score_ms;
+                regions[index].successful_probes =
+                    estimate.successful_probes;
             }
         });
     }

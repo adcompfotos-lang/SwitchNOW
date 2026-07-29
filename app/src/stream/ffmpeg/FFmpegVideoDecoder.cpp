@@ -1,8 +1,15 @@
 #include "FFmpegVideoDecoder.hpp"
 #include "AVFrameHolder.hpp"
 #include "borealis.hpp"
+#include "../DecodeQueuePolicy.hpp"
 #include "../../stream_settings.hpp"
 #include "../../video_quality_policy.hpp"
+#include <cerrno>
+#include <chrono>
+#include <sstream>
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
 #ifdef PLATFORM_APPLE
 extern "C" {
 #include <libavcodec/videotoolbox.h>
@@ -55,12 +62,73 @@ void ffmpegLog(void* ptr, int level, const char* fmt, va_list vargs) {
     brls::Logger::debug("FFmpeg [LOG]: {}", message.c_str());
 }
 
+void FFmpegVideoDecoder::append_setup_diagnostic(const std::string& value) {
+    if (!m_setup_diagnostics.empty())
+        m_setup_diagnostics += " | ";
+    m_setup_diagnostics += value;
+}
+
+int FFmpegVideoDecoder::fail_setup(const char* stage, int error_code,
+                                   const std::string& detail) {
+    char error[AV_ERROR_MAX_STRING_SIZE] = {};
+    const int normalized_error = error_code < 0 ? error_code : AVERROR_UNKNOWN;
+    av_strerror(normalized_error, error, sizeof(error));
+
+    std::string message = std::string("stage=") + (stage ? stage : "unknown") +
+                          " code=" + std::to_string(error_code) +
+                          " error=" + error;
+    if (!detail.empty())
+        message += " detail=" + detail;
+    append_setup_diagnostic(message);
+    brls::Logger::error("FFmpeg setup: {}", message);
+    return error_code < 0 ? error_code : -1;
+}
+
+AVPixelFormat FFmpegVideoDecoder::select_hardware_format(
+    AVCodecContext* context, const AVPixelFormat* formats) {
+    auto* self = context
+        ? static_cast<FFmpegVideoDecoder*>(context->opaque)
+        : nullptr;
+    if (!formats) {
+        if (self)
+            self->append_setup_diagnostic("getFormat=no-formats");
+        return AV_PIX_FMT_NONE;
+    }
+
+    std::ostringstream offered;
+    for (const AVPixelFormat* format = formats; *format != AV_PIX_FMT_NONE; ++format) {
+        if (offered.tellp() > 0)
+            offered << ",";
+        const char* name = av_get_pix_fmt_name(*format);
+        offered << (name ? name : "unknown") << "(" << static_cast<int>(*format) << ")";
+        if (*format == AV_PIX_FMT_NVTEGRA) {
+            if (self)
+                self->append_setup_diagnostic("getFormat=nvtegra offered=" + offered.str());
+            return *format;
+        }
+    }
+
+    if (self)
+        self->append_setup_diagnostic("getFormat=missing-nvtegra offered=" + offered.str());
+    return AV_PIX_FMT_NONE;
+}
+
 int FFmpegVideoDecoder::setup(int video_format, int width, int height,
                               int redraw_rate, void* context, int dr_flags) {
+    m_setup_diagnostics.clear();
+    m_first_output_format_logged = false;
     m_stream_fps = redraw_rate;
+    m_requires_hardware_frames =
+        (dr_flags & VIDEO_DECODER_REQUIRE_HARDWARE) != 0;
     m_uses_hardware_frames =
-        (dr_flags & VIDEO_DECODER_PREFER_HARDWARE) != 0 &&
+        ((dr_flags & VIDEO_DECODER_PREFER_HARDWARE) != 0 ||
+         m_requires_hardware_frames) &&
         (dr_flags & VIDEO_DECODER_FORCE_SOFTWARE) == 0;
+    append_setup_diagnostic(
+        "request=" + std::string(m_requires_hardware_frames ? "required" :
+            m_uses_hardware_frames ? "preferred" : "software") +
+        " resolution=" + std::to_string(width) + "x" + std::to_string(height) +
+        " fps=" + std::to_string(redraw_rate));
 
     std::string format;
     switch (video_format) {
@@ -115,10 +183,14 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
 #else
     if (video_format & VIDEO_FORMAT_MASK_H264) {
 #if defined(OPENNOW_ENABLE_NVDEC)
-        m_decoder = m_uses_hardware_frames
-            ? avcodec_find_decoder_by_name("h264_nvtegra")
-            : avcodec_find_decoder(AV_CODEC_ID_H264);
+        // NVTEGRA is an FFmpeg hardware acceleration path attached to the
+        // regular H.264 decoder, not a separately registered h264_nvtegra
+        // decoder. Looking up that name always failed and triggered fallback.
+        m_decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
 #else
+        if (m_requires_hardware_frames)
+            return fail_setup("compile_support", AVERROR(ENOSYS),
+                              "OPENNOW_ENABLE_NVDEC is not enabled");
         m_uses_hardware_frames = false;
         m_decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
 #endif
@@ -130,14 +202,14 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
 #endif
 
     if (m_decoder == nullptr) {
-        brls::Logger::error("FFmpeg: Couldn't find decoder");
-        return -1;
+        return fail_setup("find_decoder", AVERROR_DECODER_NOT_FOUND,
+                          "codec=" + format);
     }
+    append_setup_diagnostic("decoder=" + std::string(m_decoder->name));
 
     m_decoder_context = avcodec_alloc_context3(m_decoder);
     if (m_decoder_context == nullptr) {
-        brls::Logger::error("FFmpeg: Couldn't allocate context");
-        return -1;
+        return fail_setup("alloc_context", AVERROR(ENOMEM));
     }
 
     if (perf_lvl & DISABLE_LOOP_FILTER) {
@@ -158,11 +230,16 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
     // damage as visible macroblocks instead of holding the previous good frame.
     m_decoder_context->flags2 |= AV_CODEC_FLAG2_FAST;
 
-    // NVDEC submits asynchronously and does not benefit from CPU frame
-    // threads. The software fallback keeps one Tegra X1 core for UI/network.
+    // NVDEC submits asynchronously and does not benefit from CPU threads.
+    // Slice threading keeps software decoding parallel without holding
+    // dependent pictures in FFmpeg's frame-thread pipeline.
     const int decoder_threads = m_uses_hardware_frames ? 1 : 3;
-    m_decoder_context->thread_type = FF_THREAD_FRAME;
+    m_decoder_context->thread_type =
+        m_uses_hardware_frames ? 0 : FF_THREAD_SLICE;
     m_decoder_context->thread_count = decoder_threads;
+    append_setup_diagnostic(
+        std::string("threading=") +
+        (m_uses_hardware_frames ? "hardware-async-1" : "slice-3"));
 
     m_decoder_context->width = width;
     m_decoder_context->height = height;
@@ -180,15 +257,35 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
 
     int err = 0;
     if (hwType != AV_HWDEVICE_TYPE_NONE) {
+        std::ostringstream configurations;
+        for (int index = 0;; ++index) {
+            const AVCodecHWConfig* config = avcodec_get_hw_config(m_decoder, index);
+            if (!config)
+                break;
+            if (configurations.tellp() > 0)
+                configurations << ",";
+            const char* pixel_name = av_get_pix_fmt_name(config->pix_fmt);
+            configurations << (pixel_name ? pixel_name : "unknown")
+                           << "/device=" << static_cast<int>(config->device_type)
+                           << "/methods=" << config->methods;
+        }
+        append_setup_diagnostic(
+            "hwConfigs=" + (configurations.str().empty()
+                ? std::string("not-advertised") : configurations.str()));
+
         if ((err = av_hwdevice_ctx_create(&hw_device_ctx, hwType, nullptr, nullptr, 0)) < 0) {
-            char error[512];
-            av_strerror(err, error, sizeof(error));
-            brls::Logger::error("FFmpeg: Error initializing hardware decoder - {}", error);
-            return -1;
+            return fail_setup("create_hwdevice", err,
+                              "type=nvtegra(" + std::to_string(hwType) + ")");
         }
         m_decoder_context->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+        if (!m_decoder_context->hw_device_ctx)
+            return fail_setup("reference_hwdevice", AVERROR(ENOMEM));
+        m_decoder_context->opaque = this;
+        m_decoder_context->get_format = &FFmpegVideoDecoder::select_hardware_format;
+        append_setup_diagnostic("hwDevice=nvtegra-created");
     } else {
-        brls::Logger::info("FFmpeg: using software frames for OpenGL renderer");
+        append_setup_diagnostic("hwDevice=none");
+        brls::Logger::info("FFmpeg: using software frames for Deko3D upload");
     }
 
     if (m_uses_hardware_frames)
@@ -196,13 +293,19 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
 
     err = avcodec_open2(m_decoder_context, m_decoder, nullptr);
     if (err < 0) {
-        char error[512];
-        av_strerror(err, error, sizeof(error));
-        brls::Logger::error("FFmpeg: Couldn't open codec - {}", error);
-        return err;
+        return fail_setup("open_codec", err,
+                          "decoder=" + std::string(m_decoder->name));
     }
+    append_setup_diagnostic(
+        "codecOpen=ok activeThreads=" +
+        std::to_string(m_decoder_context->thread_count) +
+        " activeThreadType=" + std::to_string(m_decoder_context->active_thread_type));
 
-    AVFrameHolder::instance().prepare(m_uses_hardware_frames ? 3 : 4);
+    AVFrameHolder::instance().prepare(
+        opennow::video::ReadyFrameQueueCapacity(),
+        opennow::video::StartupReadyFrameDepth(),
+        std::chrono::microseconds(
+            opennow::video::FrameWaitBudgetMicroseconds(redraw_rate)));
 
     // One extra frame for decoder output while the frame holder owns deep copies.
     m_frames_size = 5 + 1;
@@ -210,28 +313,29 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
 
     tmp_frame = av_frame_alloc();
     if (!tmp_frame) {
-        brls::Logger::error("FFmpeg: Couldn't allocate temp frame");
-        return -1;
+        return fail_setup("alloc_temp_frame", AVERROR(ENOMEM));
     }
 
     for (int i = 0; i < m_frames_size; i++) {
         auto& frame = m_frames[i];
         frame = av_frame_alloc();
         if (frame == nullptr) {
-            brls::Logger::error("FFmpeg: Couldn't allocate frame");
-            return -1;
+            return fail_setup("alloc_output_frame", AVERROR(ENOMEM),
+                              "index=" + std::to_string(i));
         }
     }
 
     m_ffmpeg_buffer =
         (char*)malloc(DECODER_BUFFER_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
     if (m_ffmpeg_buffer == nullptr) {
-        brls::Logger::error("FFmpeg: Not enough memory");
+        fail_setup("alloc_input_buffer", AVERROR(ENOMEM),
+                   "bytes=" + std::to_string(DECODER_BUFFER_SIZE));
         cleanup();
         return -1;
     }
 
-    brls::Logger::info("FFmpeg: Setup done with {} frame threads", decoder_threads);
+    append_setup_diagnostic("setup=ok");
+    brls::Logger::info("FFmpeg: Setup done: {}", m_setup_diagnostics);
     return 0;
 }
 
@@ -388,6 +492,18 @@ AVFrame* FFmpegVideoDecoder::get_frame(bool native_frame) {
         char a[AV_ERROR_MAX_STRING_SIZE] = { 0 };
         brls::Logger::error("FFmpeg: Error receiving frame with error {}",  av_make_error_string(a, AV_ERROR_MAX_STRING_SIZE, err));
         return nullptr;
+    }
+
+    if (!m_first_output_format_logged) {
+        m_first_output_format_logged = true;
+        const char* pixel_name =
+            av_get_pix_fmt_name(static_cast<AVPixelFormat>(decodeFrame->format));
+        append_setup_diagnostic(
+            "firstOutput=" + std::string(pixel_name ? pixel_name : "unknown") +
+            "(" + std::to_string(decodeFrame->format) + ")" +
+            " hwFrames=" + std::to_string(hw_device_ctx ? 1 : 0));
+        brls::Logger::info("FFmpeg: first decoded output: {}",
+                           m_setup_diagnostics);
     }
 
     if (hw_device_ctx) {

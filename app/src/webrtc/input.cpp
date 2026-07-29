@@ -234,7 +234,9 @@ bool WebRtcSession::send_gamepad_input(
     float ly,
     float rx,
     float ry) {
+    interactive_input_pending_.store(true, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+    interactive_input_pending_.store(false, std::memory_order_release);
     gamepad_input_attempt_count_++;
     const PeerConnectionState peer_state = pc_ ? peer_connection_get_state(pc_) : PEER_CONNECTION_CLOSED;
     if (!pc_ || peer_state != PEER_CONNECTION_COMPLETED || !input_ready_) {
@@ -287,7 +289,9 @@ bool WebRtcSession::send_gamepad_input(
 }
 
 void WebRtcSession::send_mouse_left_button(bool pressed) {
+    interactive_input_pending_.store(true, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+    interactive_input_pending_.store(false, std::memory_order_release);
     if (!pc_ || !input_ready_ || peer_connection_get_state(pc_) != PEER_CONNECTION_COMPLETED) {
         AppendInputLog("MOUSE blocked pressed=" + std::to_string(pressed ? 1 : 0) +
                        " pc=" + std::to_string(pc_ ? 1 : 0) +
@@ -322,7 +326,9 @@ void WebRtcSession::send_mouse_move(int16_t dx, int16_t dy) {
     if (dx == 0 && dy == 0)
         return;
 
+    interactive_input_pending_.store(true, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+    interactive_input_pending_.store(false, std::memory_order_release);
     if (!pc_ || !input_ready_ || peer_connection_get_state(pc_) != PEER_CONNECTION_COMPLETED) {
         AppendInputLog("MOUSE_MOVE blocked dx=" + std::to_string(dx) +
                        " dy=" + std::to_string(dy));
@@ -341,7 +347,9 @@ void WebRtcSession::send_mouse_move(int16_t dx, int16_t dy) {
 
 void WebRtcSession::send_keyboard_key(uint16_t keycode, uint16_t scancode,
                                       uint16_t modifiers, bool pressed) {
+    interactive_input_pending_.store(true, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+    interactive_input_pending_.store(false, std::memory_order_release);
     if (!pc_ || !input_ready_ || peer_connection_get_state(pc_) != PEER_CONNECTION_COMPLETED) {
         if (!opennow::SensitiveInputLoggingSuppressed())
             AppendInputLog("KEY blocked vk=" + std::to_string(keycode) +

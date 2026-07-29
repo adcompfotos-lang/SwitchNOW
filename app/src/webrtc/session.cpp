@@ -94,7 +94,10 @@ WebRtcSession::WebRtcSession(
       ice_servers_(ice_servers),
       settings_(opennow::LoadStreamSettings()),
       peer_name_(MakePeerName()) {
-    opennow::SetStreamDiagnosticsEnabled(settings_.debug_diagnostics);
+    // Explicit NVDEC is an experimental diagnostic mode. Always retain its
+    // setup and first-frame evidence even when the general overlay is disabled.
+    opennow::SetStreamDiagnosticsEnabled(
+        settings_.debug_diagnostics || settings_.video_backend == "NVDEC");
 
     // Initialize libpeer
     peer_init();
@@ -107,17 +110,29 @@ WebRtcSession::WebRtcSession(
     auto_safe_mode_used_ = previous_nvdec_crash;
     const bool force_software = settings_.video_backend == "Software" ||
                                 previous_nvdec_crash;
+    const bool require_hardware = settings_.video_backend == "NVDEC";
     decoder_ = std::make_unique<FFmpegVideoDecoder>();
+    const int decoder_flags = force_software
+        ? VIDEO_DECODER_FORCE_SOFTWARE
+        : require_hardware
+        ? VIDEO_DECODER_REQUIRE_HARDWARE
+        : VIDEO_DECODER_PREFER_HARDWARE;
     decoder_setup_result_ = decoder_->setup(
         VIDEO_FORMAT_H264, settings_.width, settings_.height, settings_.fps, nullptr,
-        force_software ? VIDEO_DECODER_FORCE_SOFTWARE : VIDEO_DECODER_PREFER_HARDWARE);
+        decoder_flags);
+    decoder_setup_diagnostics_ = decoder_->setup_diagnostics();
 
-    if (decoder_setup_result_ != 0 && !force_software) {
+    // Auto remains resilient. Explicit NVDEC is strict so a hardware failure
+    // is visible in the debug build instead of being mislabeled as NVDEC while
+    // silently running the software decoder.
+    if (decoder_setup_result_ != 0 && !force_software && !require_hardware) {
+        nvdec_setup_diagnostics_ = decoder_setup_diagnostics_;
         decoder_->cleanup();
         decoder_ = std::make_unique<FFmpegVideoDecoder>();
         decoder_setup_result_ = decoder_->setup(
             VIDEO_FORMAT_H264, settings_.width, settings_.height, settings_.fps, nullptr,
             VIDEO_DECODER_FORCE_SOFTWARE);
+        decoder_setup_diagnostics_ = decoder_->setup_diagnostics();
         decoder_fallback_used_ = decoder_setup_result_ == 0;
     }
 
@@ -125,12 +140,14 @@ WebRtcSession::WebRtcSession(
         video_backend_name_ = "NVDEC-NVTEGRA/Deko3D-zero-copy";
     else if (decoder_setup_result_ == 0)
         video_backend_name_ = auto_safe_mode_used_
-            ? "FFmpeg-SW-3T/Deko3D-upload(crash-safe-mode)"
+            ? "FFmpeg-SW-SLICE-3T/Deko3D-upload(crash-safe-mode)"
             : decoder_fallback_used_
-            ? "FFmpeg-SW-3T/Deko3D-upload(auto-fallback)"
-            : "FFmpeg-SW-3T/Deko3D-upload";
+            ? "FFmpeg-SW-SLICE-3T/Deko3D-upload(auto-fallback)"
+            : "FFmpeg-SW-SLICE-3T/Deko3D-upload";
     else
-        video_backend_name_ = "decoder-setup-failed";
+        video_backend_name_ = require_hardware
+            ? "NVDEC-required/setup-failed"
+            : "decoder-setup-failed";
 
     if (decoder_setup_result_ == 0 && decoder_->uses_hardware_frames())
         nvdec_marker_owned_ = CreateNvdecCrashMarker();
@@ -201,6 +218,9 @@ void WebRtcSession::start() {
                     " expectedFormat=" +
                     std::string(decoder_ && decoder_->uses_hardware_frames()
                         ? "NVTEGRA" : "YUV420P/NV12"));
+    if (!nvdec_setup_diagnostics_.empty())
+        AppendStreamLog("VIDEO nvdecAttempt=" + nvdec_setup_diagnostics_);
+    AppendStreamLog("VIDEO decoderInit=" + decoder_setup_diagnostics_);
     const bool input_codec_ok = InputEncodingSelfTest();
     AppendStreamLog("INPUT codec_selftest ok=" + std::to_string(input_codec_ok ? 1 : 0));
     AppendInputLog("SESSION start codecSelfTest=" + std::to_string(input_codec_ok ? 1 : 0) +
@@ -283,9 +303,16 @@ void WebRtcSession::network_loop() {
                 constexpr auto kMaximumBatchTime = std::chrono::microseconds(1000);
                 const auto batch_started_at = std::chrono::steady_clock::now();
                 for (int packet = 0; packet < kMaximumDatagramsPerBatch; ++packet) {
-                    if (peer_connection_loop(pc_) == 0)
+                    const int processed = packet == 0
+                        ? peer_connection_loop(pc_)
+                        : peer_connection_loop_nonblocking(pc_);
+                    if (processed == 0)
                         break;
                     batch_size++;
+                    // Yield the peer lock after the current datagram when a
+                    // fresh controller, keyboard or pointer report is waiting.
+                    if (interactive_input_pending_.load(std::memory_order_acquire))
+                        break;
                     if (batch_size >= 8 &&
                         std::chrono::steady_clock::now() - batch_started_at >=
                             kMaximumBatchTime) {

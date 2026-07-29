@@ -37,7 +37,7 @@ class HttpClient
         const std::vector<std::string>& headers,
         const std::string& body) const;
 
-    int MeasureConnectLatencyMs(
+    int MeasureTcpHandshakeLatencyMs(
         const std::string& url,
         long timeout_ms = 3000) const noexcept;
 };

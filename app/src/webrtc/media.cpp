@@ -63,7 +63,10 @@ void WebRtcSession::decoder_loop() {
             if (!first_decoded_frame_logged_) {
                 first_decoded_frame_logged_ = true;
                 AppendStreamLog("DECODE first_frame frames=" + std::to_string(frame_count) +
-                                " accessUnits=" + std::to_string(access_unit_count));
+                                " accessUnits=" + std::to_string(access_unit_count) +
+                                " decoderDiag=" +
+                                (decoder_ ? decoder_->setup_diagnostics() :
+                                            std::string("decoder-unavailable")));
             } else if (frame_count - last_logged_frame_count_.load(std::memory_order_relaxed) >= 120) {
                 AppendStreamLog("DECODE frame_progress frames=" + std::to_string(frame_count) +
                                 " accessUnits=" + std::to_string(access_unit_count));
@@ -77,7 +80,10 @@ void WebRtcSession::decoder_loop() {
                                 " accessUnit=" + std::to_string(access_unit_count) +
                                 " size=" + std::to_string(unit.data.size()) +
                                 " idr=" + std::to_string(unit.idr ? 1 : 0) +
-                                " preview=" + HexPreview(unit.data.data(), unit.data.size()));
+                                " preview=" + HexPreview(unit.data.data(), unit.data.size()) +
+                                " decoderDiag=" +
+                                (decoder_ ? decoder_->setup_diagnostics() :
+                                            std::string("decoder-unavailable")));
                 last_logged_decode_error_count_.store(error_count, std::memory_order_relaxed);
             }
             decoder_resync_required_.store(true);
@@ -127,6 +133,8 @@ void WebRtcSession::enqueue_decode_unit(const uint8_t* data, size_t size, uint32
 
     if (decoder_resync_required_.load() && !idr) {
         decoder_queue_drops_++;
+        decoder_resync_drops_.fetch_add(1, std::memory_order_relaxed);
+        keyframe_needed_.store(true, std::memory_order_release);
         return;
     }
 
@@ -136,7 +144,9 @@ void WebRtcSession::enqueue_decode_unit(const uint8_t* data, size_t size, uint32
     const size_t kMaxQueuedAccessUnits =
         opennow::video::MaximumQueuedAccessUnits(settings_.fps);
     if (decoder_queue_.size() >= kMaxQueuedAccessUnits) {
-        decoder_queue_drops_ += static_cast<int>(decoder_queue_.size());
+        const size_t queued = decoder_queue_.size();
+        decoder_queue_drops_ += static_cast<int>(queued);
+        decoder_overflow_drops_.fetch_add(queued, std::memory_order_relaxed);
         clear_decoder_queue_locked();
         decoder_resync_required_.store(true);
         if (!decoder_ || !decoder_->uses_hardware_frames())
@@ -144,6 +154,7 @@ void WebRtcSession::enqueue_decode_unit(const uint8_t* data, size_t size, uint32
         keyframe_needed_.store(true);
         if (!idr) {
             decoder_queue_drops_++;
+            decoder_overflow_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
     }
@@ -180,6 +191,10 @@ void WebRtcSession::draw(NVGcontext* vg, int width, int height, AVFrame* frame, 
         render_us_total_.fetch_add(render_us, std::memory_order_relaxed);
         RecordLatency(render_latency_buckets_, render_us);
         AtomicMax(render_us_max_, render_us);
+        const uint64_t frame_budget_us =
+            1000000ULL / static_cast<uint64_t>(std::max(1, settings_.fps));
+        if (render_us > frame_budget_us)
+            render_late_frames_.fetch_add(1, std::memory_order_relaxed);
         const uint64_t previous_generation = last_presented_generation_.exchange(generation);
         if (generation != 0 && generation != previous_generation)
             presented_frames_.fetch_add(1, std::memory_order_relaxed);
@@ -236,7 +251,10 @@ void WebRtcSession::maybe_recover_decode_stall() {
                     " frames=" + std::to_string(frames_decoded_.load()));
     {
         std::lock_guard<std::mutex> queue_lock(decoder_queue_mutex_);
-        decoder_queue_drops_ += static_cast<int>(decoder_queue_.size());
+        const size_t stalled_queue_size = decoder_queue_.size();
+        decoder_queue_drops_ += static_cast<int>(stalled_queue_size);
+        decoder_stall_drops_.fetch_add(stalled_queue_size,
+                                       std::memory_order_relaxed);
         clear_decoder_queue_locked();
     }
     decoder_resync_required_.store(true);
@@ -265,19 +283,32 @@ void WebRtcSession::maybe_recover_rtp_damage() {
                         " gaps=" + std::to_string(stats.sequence_gaps) +
                         " reordered=" + std::to_string(stats.reordered_packets) +
                         " late=" + std::to_string(stats.late_packets_dropped) +
-                        " forced=" + std::to_string(stats.forced_sequence_skips));
+                        " forced=" + std::to_string(stats.forced_sequence_skips) +
+                        " adaptiveHold/recovered/expired=" +
+                        std::to_string(stats.reorder_adaptive_holds) + "/" +
+                        std::to_string(stats.reorder_gap_recoveries) + "/" +
+                        std::to_string(stats.reorder_gap_expirations) +
+                        " graceMs=" +
+                        std::to_string(stats.reorder_gap_hold_ms) + "/" +
+                        std::to_string(stats.reorder_burst_gap_hold_ms) +
+                        " nack/retry/rtx=" +
+                        std::to_string(stats.nack_requests) + "/" +
+                        std::to_string(stats.nack_retries) + "/" +
+                        std::to_string(stats.rtx_packets_recovered));
     }
-    // Once a reference picture is missing, subsequent P frames are not safe to
-    // display on either backend. Hold the previous good frame and resume from
-    // an IDR; only the software decoder is flushed because Deko3D can still own
-    // references to NVDEC output surfaces.
+    // Once a reference picture is missing, reject later P frames and resume at
+    // the next IDR. Preserve access units that were completed before the loss:
+    // flushing those healthy pictures turned one damaged AU into a visible
+    // multi-frame stall and repeatedly reset the software decoder.
     if (!decoder_resync_required_.exchange(true)) {
-        std::lock_guard<std::mutex> queue_lock(decoder_queue_mutex_);
-        decoder_queue_drops_ += static_cast<int>(decoder_queue_.size());
-        clear_decoder_queue_locked();
-        if (!decoder_ || !decoder_->uses_hardware_frames())
-            decoder_reset_requested_.store(true);
         keyframe_needed_.store(true);
+        std::size_t preserved_queue_size = 0;
+        {
+            std::lock_guard<std::mutex> queue_lock(decoder_queue_mutex_);
+            preserved_queue_size = decoder_queue_.size();
+        }
+        AppendStreamLog("RTP recovery=hold_until_idr queuePreserved=" +
+                        std::to_string(preserved_queue_size));
     }
     // Do not flush healthy queued frames or request an IDR for every damaged
     // access unit. Large IDRs amplify packet bursts and previously created a
@@ -288,9 +319,13 @@ void WebRtcSession::maybe_recover_rtp_damage() {
 
 void WebRtcSession::request_keyframe(const char* reason) {
     const auto now = std::chrono::steady_clock::now();
-    constexpr auto kMinimumPliInterval = std::chrono::milliseconds(1500);
+    const auto minimum_pli_interval = decoder_resync_required_.load()
+        ? frames_decoded_.load(std::memory_order_relaxed) == 0
+            ? std::chrono::milliseconds(600)
+            : std::chrono::milliseconds(900)
+        : std::chrono::milliseconds(1500);
     if (last_keyframe_request_at_.time_since_epoch().count() != 0 &&
-        now - last_keyframe_request_at_ < kMinimumPliInterval) {
+        now - last_keyframe_request_at_ < minimum_pli_interval) {
         // Keep one coalesced request pending. poll() will retry it after the
         // cooldown instead of flooding the server with expensive IDR frames.
         if (decoder_resync_required_.load())
@@ -308,6 +343,11 @@ void WebRtcSession::request_keyframe(const char* reason) {
                     " frames=" + std::to_string(frames_decoded_.load()) +
                     " backlog=" + std::to_string(std::max(0, packets_received_.load() - frames_decoded_.load())));
 
+    // Keep one bounded retry armed while damaged reference pictures are being
+    // rejected. Decoding a valid IDR clears both flags in decoder_loop().
+    if (decoder_resync_required_.load())
+        keyframe_needed_.store(true);
+
     if (pli_result >= 0 || !signaling_client_ || remote_peer_id_ <= 0)
         return;
 
@@ -324,6 +364,28 @@ void WebRtcSession::request_keyframe(const char* reason) {
 void WebRtcSession::on_video_packet(const PeerVideoPacket& packet) {
     const uint8_t* data = packet.data;
     const size_t size = packet.size;
+    const bool idr = ContainsH264Idr(data, size);
+
+    // The RTP decoder invokes this callback from the media thread immediately
+    // after completing an access unit. Detect a preceding damaged AU here,
+    // before another dependent P frame can enter the decode queue. The slower
+    // poll path still records diagnostics and sends the coalesced PLI.
+    PeerVideoRtpStats immediate_stats {};
+    if (pc_ &&
+        peer_connection_get_video_rtp_stats(pc_, &immediate_stats) == 0) {
+        uint32_t previous_damage =
+            last_rtp_damage_gate_.load(std::memory_order_relaxed);
+        if (immediate_stats.access_units_dropped > previous_damage &&
+            last_rtp_damage_gate_.compare_exchange_strong(
+                previous_damage,
+                immediate_stats.access_units_dropped,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            decoder_resync_required_.store(true, std::memory_order_release);
+            keyframe_needed_.store(true, std::memory_order_release);
+        }
+    }
+
     last_video_packet_at_us_.store(NowUs(), std::memory_order_release);
     video_access_unit_bytes_.fetch_add(size, std::memory_order_relaxed);
     AtomicMax(video_access_unit_max_bytes_, static_cast<uint64_t>(size));
@@ -340,7 +402,7 @@ void WebRtcSession::on_video_packet(const PeerVideoPacket& packet) {
     if (!first_video_packet_logged_) {
         first_video_packet_logged_ = true;
         AppendStreamLog("VIDEO first_access_unit size=" + std::to_string(size) +
-                        " idr=" + std::to_string(ContainsH264Idr(data, size) ? 1 : 0) +
+                        " idr=" + std::to_string(idr ? 1 : 0) +
                         " preview=" + HexPreview(data, size));
         log_stream_summary("first_video_packet");
     } else if (packet_count - last_logged_packet_count_ >= 120) {

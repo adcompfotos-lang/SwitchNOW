@@ -183,7 +183,7 @@ HttpResponse HttpClient::Post(
     return Request("POST", url, user_agent, headers, body);
 }
 
-int HttpClient::MeasureConnectLatencyMs(
+int HttpClient::MeasureTcpHandshakeLatencyMs(
     const std::string& url,
     long timeout_ms) const noexcept
 {
@@ -204,12 +204,19 @@ int HttpClient::MeasureConnectLatencyMs(
     if (curl_easy_perform(curl.get()) != CURLE_OK)
         return -1;
 
+    // A region estimate should reflect the network path, not DNS lookup or
+    // variable TLS negotiation. TCP connect is approximately one network RTT.
+    double lookup_seconds = 0.0;
     double connect_seconds = 0.0;
-    if (curl_easy_getinfo(curl.get(), CURLINFO_CONNECT_TIME, &connect_seconds) != CURLE_OK ||
-        connect_seconds < 0.0)
+    if (curl_easy_getinfo(curl.get(), CURLINFO_NAMELOOKUP_TIME, &lookup_seconds) != CURLE_OK)
+        return -1;
+    if (curl_easy_getinfo(curl.get(), CURLINFO_CONNECT_TIME, &connect_seconds) != CURLE_OK)
+        return -1;
+    const double handshake_seconds = connect_seconds - lookup_seconds;
+    if (handshake_seconds <= 0.0)
         return -1;
 
-    return static_cast<int>(std::lround(connect_seconds * 1000.0));
+    return static_cast<int>(std::lround(handshake_seconds * 1000.0));
 }
 
 } // namespace opennow

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.1.0"
+    [string]$Version = "1.1.5"
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +30,7 @@ function Copy-CleanTree([string]$Source, [string]$Destination) {
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     & robocopy $Source $Destination /E /NFL /NDL /NJH /NJS /NP `
         /XD .git build dist .cache .codex_refs .idea .vscode __pycache__ node_modules pokemon xml `
-        /XF *.log *.tmp *.bak *.user *.suo *.pdb *.ilk *.exe *.o *.obj `
+        /XF .git *.log *.tmp *.bak *.user *.suo *.pdb *.ilk *.exe *.o *.obj `
             auth_accounts.json auth_session.json native_credentials.json `
             stream_settings.json nte.txt first_frame.ppm demo_icon.jpg `
             opennow_logo.png opennow_switch_icon.jpg tiles.png | Out-Null
@@ -56,6 +56,16 @@ Copy-Item -LiteralPath (Join-Path $repo "resources\icon\icon.png") -Destination 
 Copy-Item -LiteralPath (Join-Path $repo "README.md") -Destination $releaseOut -Force
 Copy-Item -LiteralPath (Join-Path $repo "docs\PATCH_NOTES_1.x_RU.md") `
     -Destination (Join-Path $releaseOut "CHANGELOG_RU.md") -Force
+$releaseNotes = Join-Path $repo ("docs\RELEASE_NOTES_{0}_RU.md" -f $Version)
+if (Test-Path -LiteralPath $releaseNotes) {
+    Copy-Item -LiteralPath $releaseNotes `
+        -Destination (Join-Path $releaseOut "RELEASE_NOTES_RU.md") -Force
+}
+$versionChanges = Join-Path $repo "docs\CHANGES_1.1.1_TO_1.1.5_RU.md"
+if (Test-Path -LiteralPath $versionChanges) {
+    Copy-Item -LiteralPath $versionChanges `
+        -Destination (Join-Path $releaseOut "CHANGES_1.1.1_TO_1.1.5_RU.md") -Force
+}
 
 @(
     "SwitchNOW $Version",

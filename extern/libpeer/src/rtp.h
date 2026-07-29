@@ -85,6 +85,7 @@ typedef void (*RtpOnVideoPacket)(const PeerVideoPacket* packet, void* user_data)
 // window turns normal UDP burst reordering into artificial packet loss.
 #define RTP_REORDER_WINDOW 128
 #define RTP_REORDER_MAX_HOLD_PACKETS 64
+#define RTP_REORDER_BURST_MAX_HOLD_PACKETS 112
 #define RTP_REORDER_PACKET_CAPACITY (CONFIG_MTU + 256)
 
 struct RtpDecoder {
@@ -133,6 +134,15 @@ struct RtpDecoder {
   uint32_t reordered_packets;
   uint32_t late_packets_dropped;
   uint32_t forced_sequence_skips;
+  uint32_t startup_sequence_rebases;
+  uint32_t reorder_gap_started_ms;
+  uint32_t reorder_gap_hold_ms;
+  uint32_t reorder_burst_gap_hold_ms;
+  uint32_t reorder_adaptive_holds;
+  uint32_t reorder_gap_recoveries;
+  uint32_t reorder_gap_expirations;
+  uint32_t reorder_burst_fast_forwards;
+  uint8_t reorder_gap_wait_counted;
 };
 
 struct RtpEncoder {
@@ -149,6 +159,10 @@ struct RtpEncoder {
 
 int rtp_packet_validate(uint8_t* packet, size_t size);
 
+// Converts an RFC 4588 RTX packet back into its original media RTP packet.
+int rtp_packet_unwrap_rtx(uint8_t* packet, size_t* size, uint8_t media_payload_type,
+                          uint32_t media_ssrc);
+
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 
 int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* data, size_t size);
@@ -161,6 +175,13 @@ void rtp_decoder_set_video_callback(RtpDecoder* rtp_decoder, RtpOnVideoPacket on
 void rtp_decoder_cleanup(RtpDecoder* rtp_decoder);
 
 int rtp_decoder_decode(RtpDecoder* rtp_decoder, const uint8_t* data, size_t size);
+
+void rtp_decoder_set_reorder_grace_ms(RtpDecoder* rtp_decoder, uint32_t hold_ms);
+void rtp_decoder_set_reorder_burst_grace_ms(RtpDecoder* rtp_decoder,
+                                            uint32_t hold_ms);
+
+int rtp_decoder_get_nack(const RtpDecoder* rtp_decoder, uint16_t* packet_id,
+                         uint16_t* bitmask);
 
 uint32_t rtp_get_ssrc(uint8_t* packet);
 

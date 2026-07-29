@@ -23,6 +23,18 @@ class NativeLoginFallbackRequired : public std::runtime_error
     using std::runtime_error::runtime_error;
 };
 
+class CloudSessionNotFound : public std::runtime_error
+{
+  public:
+    using std::runtime_error::runtime_error;
+};
+
+class AutomaticRegionSessionLost : public CloudSessionNotFound
+{
+  public:
+    using CloudSessionNotFound::CloudSessionNotFound;
+};
+
 class GfnClient
 {
   public:
@@ -61,7 +73,8 @@ class GfnClient
 
     SessionInfo StartSession(AuthSession& session, const std::string& launch_app_id,
                              const std::string& launch_store = "",
-                             const std::string& internal_title = "") const;
+                             const std::string& internal_title = "",
+                             bool force_provider_endpoint = false) const;
     SessionInfo PollSession(AuthSession& session, const std::string& session_id) const;
     void StopSession(
         AuthSession& session,

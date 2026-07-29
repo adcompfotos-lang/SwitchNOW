@@ -5,7 +5,9 @@
 #include "address.h"
 #include "config.h"
 #include "peer_connection.h"
+#include "ports.h"
 #include "rtp.h"
+#include "rtp_recovery.h"
 #include "utils.h"
 
 typedef enum RtpH264Type {
@@ -51,6 +53,18 @@ static uint32_t read_be32(const uint8_t* data) {
          ((uint32_t)data[1] << 16) |
          ((uint32_t)data[2] << 8) |
          (uint32_t)data[3];
+}
+
+static void write_be16(uint8_t* data, uint16_t value) {
+  data[0] = (uint8_t)(value >> 8);
+  data[1] = (uint8_t)value;
+}
+
+static void write_be32(uint8_t* data, uint32_t value) {
+  data[0] = (uint8_t)(value >> 24);
+  data[1] = (uint8_t)(value >> 16);
+  data[2] = (uint8_t)(value >> 8);
+  data[3] = (uint8_t)value;
 }
 
 static int rtp_parse_payload(uint8_t* packet, size_t size, RtpPayloadView* view) {
@@ -109,6 +123,27 @@ int rtp_packet_validate(uint8_t* packet, size_t size) {
 
   const uint8_t payload_type = packet[1] & 0x7f;
   return ((payload_type < 64) || (payload_type >= 96));
+}
+
+int rtp_packet_unwrap_rtx(uint8_t* packet, size_t* size, uint8_t media_payload_type,
+                          uint32_t media_ssrc) {
+  if (!packet || !size)
+    return -1;
+
+  RtpPayloadView view;
+  if (rtp_parse_payload(packet, *size, &view) != 0 || view.payload_size < 2)
+    return -1;
+
+  const uint16_t original_sequence = read_be16(view.payload);
+  const size_t payload_offset = (size_t)(view.payload - packet);
+  memmove(packet + payload_offset, packet + payload_offset + 2,
+          *size - payload_offset - 2);
+  *size -= 2;
+
+  packet[1] = (uint8_t)((packet[1] & 0x80) | (media_payload_type & 0x7f));
+  write_be16(packet + 2, original_sequence);
+  write_be32(packet + 8, media_ssrc);
+  return 0;
 }
 
 uint32_t rtp_get_ssrc(uint8_t* packet) {
@@ -612,6 +647,9 @@ void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_
   memset(rtp_decoder, 0, sizeof(*rtp_decoder));
   rtp_decoder->on_packet = on_packet;
   rtp_decoder->user_data = user_data;
+  rtp_decoder->reorder_gap_hold_ms = RTP_RECOVERY_DEFAULT_GAP_HOLD_MS;
+  rtp_decoder->reorder_burst_gap_hold_ms =
+      RTP_RECOVERY_BURST_MIN_HOLD_MS;
 
   switch (codec) {
     case CODEC_H264:
@@ -691,6 +729,39 @@ static int rtp_decoder_drain_reorder_buffer(RtpDecoder* rtp_decoder) {
   return result;
 }
 
+static void rtp_decoder_refresh_gap_clock(RtpDecoder* rtp_decoder,
+                                          uint32_t now_ms) {
+  if (rtp_decoder->reorder_buffered_packets == 0) {
+    rtp_decoder->reorder_gap_started_ms = 0;
+    rtp_decoder->reorder_gap_wait_counted = 0;
+    return;
+  }
+
+  rtp_decoder->reorder_gap_started_ms = now_ms;
+  rtp_decoder->reorder_gap_wait_counted = 0;
+}
+
+static uint16_t rtp_decoder_nearest_recovery_sequence(
+    const RtpDecoder* rtp_decoder, uint16_t incoming_sequence) {
+  uint16_t nearest = incoming_sequence;
+  int16_t nearest_distance =
+      (int16_t)(incoming_sequence - rtp_decoder->reorder_expected_sequence);
+
+  for (size_t slot = 0; slot < RTP_REORDER_WINDOW; ++slot) {
+    if (!rtp_decoder->reorder_used[slot])
+      continue;
+    const int16_t distance =
+        (int16_t)(rtp_decoder->reorder_sequences[slot] -
+                  rtp_decoder->reorder_expected_sequence);
+    if (distance > 0 && distance < nearest_distance) {
+      nearest = rtp_decoder->reorder_sequences[slot];
+      nearest_distance = distance;
+    }
+  }
+
+  return nearest;
+}
+
 static int rtp_decoder_decode_reordered(RtpDecoder* rtp_decoder, const uint8_t* buf, size_t size) {
   if (!rtp_decoder->reorder_buf || size < 4 || size > RTP_REORDER_PACKET_CAPACITY)
     return -1;
@@ -701,25 +772,89 @@ static int rtp_decoder_decode_reordered(RtpDecoder* rtp_decoder, const uint8_t* 
     rtp_decoder->reorder_expected_sequence = sequence;
   }
 
+  const uint32_t now_ms = ports_get_epoch_time();
   int16_t distance = (int16_t)(sequence - rtp_decoder->reorder_expected_sequence);
   if (distance < 0) {
     rtp_decoder->late_packets_dropped++;
     return 0;
   }
+  if (distance > 0 && rtp_decoder->reorder_gap_started_ms == 0) {
+    rtp_decoder->reorder_gap_started_ms = now_ms;
+    rtp_decoder->reorder_gap_wait_counted = 0;
+  }
 
-  // Leave roughly one network RTT for retransmission, but do not block the
-  // decoder behind the full allocation window after permanent packet loss.
+  // Signaling can leave stale datagrams in flight before the live sequence
+  // arrives. A stricter threshold remains available during the short startup
+  // window because the discontinuity may occur after the first complete AU.
+  if (distance > 0 &&
+      rtp_recovery_should_rebase_startup(
+          (uint16_t)distance, rtp_decoder->access_units_completed,
+          rtp_decoder->startup_sequence_rebases)) {
+    memset(rtp_decoder->reorder_used, 0, sizeof(rtp_decoder->reorder_used));
+    rtp_decoder->reorder_buffered_packets = 0;
+    rtp_decoder_reset_fragment(rtp_decoder);
+    rtp_decoder_reset_access_unit(rtp_decoder);
+    rtp_decoder->has_last_seq_number = 0;
+    rtp_decoder->reorder_expected_sequence = sequence;
+    rtp_decoder->startup_sequence_rebases++;
+    rtp_decoder->reorder_gap_started_ms = 0;
+    rtp_decoder->reorder_gap_wait_counted = 0;
+    distance = 0;
+  }
+
+  // Packet distance alone is not a stable delay budget: the same 64 packets
+  // arrive much faster in a complex scene. Hold only an active gap for the
+  // measured RTT plus jitter, with a hard packet bound below the allocation
+  // window. Once recovery is no longer possible, jump to the nearest buffered
+  // sequence in one operation. Advancing hundreds of sequence numbers one by
+  // one blocked the media thread during Fortnite burst loss.
   while (distance >= RTP_REORDER_MAX_HOLD_PACKETS) {
-    rtp_decoder->reorder_expected_sequence++;
-    rtp_decoder->forced_sequence_skips++;
+    const uint32_t gap_age_ms =
+        rtp_decoder->reorder_gap_started_ms == 0
+            ? 0
+            : now_ms - rtp_decoder->reorder_gap_started_ms;
+    const uint32_t effective_hold_ms =
+        distance >= RTP_RECOVERY_BURST_GAP_DISTANCE
+            ? rtp_decoder->reorder_burst_gap_hold_ms
+            : rtp_decoder->reorder_gap_hold_ms;
+    const uint16_t recovery_distance = (uint16_t)distance;
+    if (rtp_recovery_should_wait_for_gap(
+            recovery_distance, gap_age_ms, effective_hold_ms,
+            RTP_REORDER_BURST_MAX_HOLD_PACKETS)) {
+      if (!rtp_decoder->reorder_gap_wait_counted) {
+        rtp_decoder->reorder_adaptive_holds++;
+        rtp_decoder->reorder_gap_wait_counted = 1;
+      }
+      break;
+    }
+    if (!rtp_recovery_should_fast_forward(
+            recovery_distance, gap_age_ms, effective_hold_ms,
+            RTP_REORDER_BURST_MAX_HOLD_PACKETS))
+      break;
+
+    const uint16_t recovery_sequence =
+        rtp_decoder_nearest_recovery_sequence(rtp_decoder, sequence);
+    const uint16_t skipped =
+        (uint16_t)(recovery_sequence -
+                   rtp_decoder->reorder_expected_sequence);
+    if (skipped == 0)
+      break;
+
+    rtp_decoder->reorder_expected_sequence = recovery_sequence;
+    rtp_decoder->forced_sequence_skips += skipped;
+    rtp_decoder->reorder_gap_expirations++;
+    rtp_decoder->reorder_burst_fast_forwards++;
     rtp_decoder_drain_reorder_buffer(rtp_decoder);
     distance = (int16_t)(sequence - rtp_decoder->reorder_expected_sequence);
   }
 
   if (distance == 0) {
+    if (rtp_decoder->reorder_gap_started_ms != 0)
+      rtp_decoder->reorder_gap_recoveries++;
     const int result = rtp_decoder->decode_func(rtp_decoder, (uint8_t*)buf, size);
     rtp_decoder->reorder_expected_sequence++;
     rtp_decoder_drain_reorder_buffer(rtp_decoder);
+    rtp_decoder_refresh_gap_clock(rtp_decoder, now_ms);
     return result;
   }
 
@@ -738,6 +873,72 @@ static int rtp_decoder_decode_reordered(RtpDecoder* rtp_decoder, const uint8_t* 
   rtp_decoder->reorder_buffered_packets++;
   rtp_decoder->reordered_packets++;
   return 0;
+}
+
+void rtp_decoder_set_reorder_grace_ms(RtpDecoder* rtp_decoder,
+                                      uint32_t hold_ms) {
+  if (!rtp_decoder)
+    return;
+  rtp_decoder->reorder_gap_hold_ms =
+      rtp_recovery_clamp_u32(hold_ms, RTP_RECOVERY_MIN_GAP_HOLD_MS,
+                             RTP_RECOVERY_MAX_GAP_HOLD_MS);
+}
+
+void rtp_decoder_set_reorder_burst_grace_ms(RtpDecoder* rtp_decoder,
+                                            uint32_t hold_ms) {
+  if (!rtp_decoder)
+    return;
+  rtp_decoder->reorder_burst_gap_hold_ms =
+      rtp_recovery_clamp_u32(hold_ms, RTP_RECOVERY_BURST_MIN_HOLD_MS,
+                             RTP_RECOVERY_MAX_GAP_HOLD_MS);
+}
+
+int rtp_decoder_get_nack(const RtpDecoder* rtp_decoder, uint16_t* packet_id,
+                         uint16_t* bitmask) {
+  const uint16_t evidence_packets =
+      rtp_decoder
+          ? rtp_recovery_nack_evidence_packets(
+                rtp_decoder->access_units_completed)
+          : 3u;
+  if (!rtp_decoder || !packet_id || !bitmask ||
+      !rtp_decoder->reorder_has_expected_sequence ||
+      rtp_decoder->reorder_buffered_packets < evidence_packets) {
+    return 0;
+  }
+
+  const uint16_t expected = rtp_decoder->reorder_expected_sequence;
+  const size_t expected_slot = expected % RTP_REORDER_WINDOW;
+  if (rtp_decoder->reorder_used[expected_slot] &&
+      rtp_decoder->reorder_sequences[expected_slot] == expected) {
+    return 0;
+  }
+
+  uint16_t furthest = 0;
+  for (size_t slot = 0; slot < RTP_REORDER_WINDOW; ++slot) {
+    if (!rtp_decoder->reorder_used[slot])
+      continue;
+    const int16_t distance =
+        (int16_t)(rtp_decoder->reorder_sequences[slot] - expected);
+    if (distance > 0 && (uint16_t)distance > furthest)
+      furthest = (uint16_t)distance;
+  }
+  if (furthest < evidence_packets)
+    return 0;
+
+  uint16_t mask = 0;
+  const uint16_t limit = furthest < 17 ? furthest : 17;
+  for (uint16_t offset = 1; offset < limit; ++offset) {
+    const uint16_t sequence = (uint16_t)(expected + offset);
+    const size_t slot = sequence % RTP_REORDER_WINDOW;
+    const int present = rtp_decoder->reorder_used[slot] &&
+                        rtp_decoder->reorder_sequences[slot] == sequence;
+    if (!present)
+      mask |= (uint16_t)(1u << (offset - 1u));
+  }
+
+  *packet_id = expected;
+  *bitmask = mask;
+  return 1;
 }
 
 int rtp_decoder_decode(RtpDecoder* rtp_decoder, const uint8_t* buf, size_t size) {
