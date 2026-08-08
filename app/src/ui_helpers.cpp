@@ -1,9 +1,13 @@
 #include "ui_helpers.hpp"
 
+#include "ad_playback.hpp"
+#include "ad_break_policy.hpp"
+#include "ad_report_policy.hpp"
 #include "app_state.hpp"
 #include "cover_image_cache.hpp"
 #include "play_history.hpp"
 #include "localization.hpp"
+#include "runtime_journal.hpp"
 #include <borealis.hpp>
 #include <switch.h>
 #include <atomic>
@@ -12,7 +16,9 @@
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
+#include <unordered_set>
 #include "StreamView.hpp"
 
 namespace opennow
@@ -279,6 +285,11 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
     detail_label->setMarginBottom(4);
     box->addView(detail_label);
 
+    auto ad_playback_state = std::make_shared<AdvertisementPlaybackState>();
+    auto* ad_playback_view = new AdvertisementPlaybackView(ad_playback_state);
+    ad_playback_view->setVisibility(brls::Visibility::GONE);
+    box->addView(ad_playback_view);
+
     SetLaunchProgress(animation, stage_label, detail_label, 0,
                       "Checking your NVIDIA account",
                       "Validating the saved session before requesting a cloud rig.", 0.08f);
@@ -310,7 +321,8 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
     });
     dialog->open();
 
-    brls::async([dialog, animation, stage_label, detail_label,
+    brls::async([dialog, game_header, animation, stage_label, detail_label,
+                 ad_playback_view, ad_playback_state,
                  bg_client, bg_auth, bg_app_id, bg_store, bg_internal_title,
                  bg_history_game_id, launch_state]() mutable {
         auto post_progress = [animation, stage_label, detail_label, launch_state](
@@ -321,6 +333,23 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     return;
                 SetLaunchProgress(animation, stage_label, detail_label,
                                   stage, title, detail, progress);
+            });
+        };
+        auto show_advertisement = [game_header, animation, stage_label,
+                                   detail_label, ad_playback_view,
+                                   launch_state](bool show) {
+            brls::sync([game_header, animation, stage_label, detail_label,
+                        ad_playback_view, launch_state, show]() {
+                if (!launch_state->running)
+                    return;
+                const auto normal = show
+                    ? brls::Visibility::GONE : brls::Visibility::VISIBLE;
+                game_header->setVisibility(normal);
+                animation->setVisibility(normal);
+                stage_label->setVisibility(normal);
+                detail_label->setVisibility(normal);
+                ad_playback_view->setVisibility(show
+                    ? brls::Visibility::VISIBLE : brls::Visibility::GONE);
             });
         };
         try {
@@ -356,6 +385,9 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
             int unknown_status_polls = 0;
             bool provider_fallback_used = false;
             int app_patching_retries = 0;
+            bool ad_break_logged = false;
+            std::unordered_set<std::string> completed_ads;
+            HttpClient ad_http_client;
             
             while (info.status != 2 && info.status != 3) {
                 if (info.status > 3 && info.status != 6) {
@@ -369,7 +401,126 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                 const float queue_progress = info.status == 0 ? 0.34f : 0.48f;
                 std::string queue_title;
                 std::string queue_detail;
-                if (info.queue_position > 0)
+                const auto ad_state = ad_break::Classify(info.ad_break);
+                if (ad_state == ad_break::PresentationState::MediaReady)
+                {
+                    const int duration = ad_break::TotalDurationSeconds(info.ad_break);
+                    const auto* media = ad_break::SelectPreferredMedia(info.ad_break);
+                    queue_title = "Advertisement required";
+                    queue_detail = "Free-tier advertisement ready";
+                    if (duration > 0)
+                        queue_detail += " (" + std::to_string(duration) + " seconds)";
+                    if (media && !media->encoding_profile.empty())
+                        queue_detail += ". Prepared format: " + media->encoding_profile;
+                    queue_detail += ". Playback will begin automatically.";
+
+                    if (!ad_break_logged)
+                    {
+                        std::ostringstream details;
+                        details << "ads=" << info.ad_break.ads.size()
+                                << " duration_seconds=" << duration
+                                << " provider=" << info.ad_break.provider
+                                << " media_profile="
+                                << (media ? media->encoding_profile : "missing");
+                        LogRuntimeEvent("session", "ad_break_detected", details.str());
+                        ad_break_logged = true;
+                    }
+
+                    constexpr size_t kMaximumAdsPerBreak = 16;
+                    size_t ads_played_this_break = 0;
+                    bool played_ad = false;
+                    while (ads_played_this_break < kMaximumAdsPerBreak)
+                    {
+                        if (!launch_state->running)
+                            return;
+
+                        // NVIDIA may return additional ads after accepting the
+                        // Start report, so select from the latest response on
+                        // every iteration instead of snapshotting the list.
+                        const auto next_ad = std::find_if(
+                            info.ad_break.ads.begin(), info.ad_break.ads.end(),
+                            [&](const SessionAdInfo& candidate) {
+                                return !candidate.id.empty() &&
+                                    completed_ads.count(candidate.id) == 0;
+                            });
+                        if (next_ad == info.ad_break.ads.end())
+                            break;
+                        const SessionAdInfo ad = *next_ad;
+                        const auto* ad_media = ad_break::SelectPreferredMedia(ad);
+                        if (!ad_media || ad_media->url.empty())
+                            throw std::runtime_error(
+                                "NVIDIA requires an advertisement but did not provide playable media.");
+
+                        show_advertisement(true);
+                        bool start_reported = false;
+                        auto playback = PlayAdvertisementMedia(
+                            ad, *ad_media, ad_http_client,
+                            ad_playback_state,
+                            [launch_state]() { return !launch_state->running.load(); },
+                            [&]() {
+                                info = bg_client.ReportSessionAd(
+                                    bg_auth, info.session_id,
+                                    ad_report::Started(ad.id));
+                                start_reported = true;
+                            });
+
+                        if (!playback.completed)
+                        {
+                            if (start_reported)
+                            {
+                                try
+                                {
+                                    (void)bg_client.ReportSessionAd(
+                                        bg_auth, info.session_id,
+                                        ad_report::Cancelled(
+                                            ad.id, playback.watched_time_ms,
+                                            playback.cancelled
+                                                ? "user_cancelled"
+                                                : "playback_error"));
+                                }
+                                catch (...) {}
+                            }
+                            show_advertisement(false);
+                            if (!launch_state->running || playback.cancelled)
+                                return;
+                            throw std::runtime_error(
+                                playback.error.empty()
+                                    ? "Advertisement playback did not complete."
+                                    : playback.error);
+                        }
+
+                        info = bg_client.ReportSessionAd(
+                            bg_auth, info.session_id,
+                            ad_report::Finished(
+                                ad.id, playback.watched_time_ms,
+                                std::max(0, ad.duration_seconds) * 1000));
+                        completed_ads.insert(ad.id);
+                        ++ads_played_this_break;
+                        played_ad = true;
+                        LogRuntimeEvent(
+                            "session", "ad_playback_completed",
+                            "watched_ms=" +
+                            std::to_string(playback.watched_time_ms) +
+                            " completed=" +
+                            std::to_string(completed_ads.size()) +
+                            " server_ads=" +
+                            std::to_string(info.ad_break.ads.size()));
+                    }
+                    if (ads_played_this_break == kMaximumAdsPerBreak)
+                        throw std::runtime_error(
+                            "NVIDIA returned too many advertisements in one break.");
+                    show_advertisement(false);
+                    if (played_ad)
+                        post_progress(
+                            1, "Advertisement complete",
+                            "Returning to cloud rig preparation.", 0.48f);
+                }
+                else if (ad_state == ad_break::PresentationState::AwaitingMetadata)
+                {
+                    queue_title = "Advertisement required";
+                    queue_detail = "Waiting for NVIDIA to provide the Free-tier advertisement details.";
+                }
+                else if (info.queue_position > 0)
                 {
                     queue_title = "Position in queue: " + std::to_string(info.queue_position);
                     queue_detail = info.status == 0
@@ -386,7 +537,10 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     queue_title = info.app_patching ? "Updating the game" : "Preparing your cloud rig";
                     queue_detail = SessionStatusText(info);
                 }
-                post_progress(1, queue_title, queue_detail, queue_progress);
+                post_progress(1, queue_title, queue_detail,
+                              ad_state == ad_break::PresentationState::None
+                                  ? queue_progress
+                                  : 0.44f);
 
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 if (!launch_state->running) return;
@@ -503,6 +657,7 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
             });
 
         } catch (const std::exception& e) {
+            show_advertisement(false);
             std::string err = e.what();
             brls::sync([=]() {
                 if (!launch_state->running) return;

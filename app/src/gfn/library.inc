@@ -441,6 +441,11 @@ std::string SessionInfoTraceSummary(const SessionInfo& info)
         << " signalingUrl=" << info.signaling_url
         << " media=" << info.media_ip << ":" << info.media_port
         << " iceServers=" << info.ice_servers.size()
-        << " sessionToken=" << (info.session_token.empty() ? "missing" : "present");
+        << " sessionToken=" << (info.session_token.empty() ? "missing" : "present")
+        << " adsRequired=" << (info.ad_break.required ? 1 : 0)
+        << " ads=" << info.ad_break.ads.size()
+        << " adDurationSec=" << ad_break::TotalDurationSeconds(info.ad_break);
+    if (const auto* media = ad_break::SelectPreferredMedia(info.ad_break))
+        out << " adMediaProfile=" << media->encoding_profile;
     return out.str();
 }

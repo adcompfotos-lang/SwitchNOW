@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <cstdio>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -40,6 +41,30 @@ bool IsSessionPollRequest(
     const auto marker = url.find("/v2/session/");
     return marker != std::string::npos &&
            marker + std::string("/v2/session/").size() < url.size();
+}
+
+struct DownloadProgressContext
+{
+    const std::function<void(long long, long long)>* on_progress = nullptr;
+    const std::function<bool()>* is_cancelled = nullptr;
+};
+
+int DownloadProgress(
+    void* userdata,
+    curl_off_t total,
+    curl_off_t downloaded,
+    curl_off_t,
+    curl_off_t)
+{
+    auto* context = static_cast<DownloadProgressContext*>(userdata);
+    if (context->is_cancelled && *context->is_cancelled &&
+        (*context->is_cancelled)())
+        return 1;
+    if (context->on_progress && *context->on_progress)
+        (*context->on_progress)(
+            static_cast<long long>(downloaded),
+            static_cast<long long>(total));
+    return 0;
 }
 
 } // namespace
@@ -181,6 +206,66 @@ HttpResponse HttpClient::Post(
     const std::string& body) const
 {
     return Request("POST", url, user_agent, headers, body);
+}
+
+void HttpClient::DownloadToFile(
+    const std::string& url,
+    const std::string& destination,
+    const std::string& user_agent,
+    const std::vector<std::string>& headers,
+    const std::function<void(long long, long long)>& on_progress,
+    const std::function<bool()>& is_cancelled) const
+{
+    FILE* output = std::fopen(destination.c_str(), "wb");
+    if (!output)
+        throw std::runtime_error("Could not create the advertisement media file");
+    std::unique_ptr<FILE, decltype(&std::fclose)> file(output, &std::fclose);
+
+    CURL* raw = curl_easy_init();
+    if (!raw)
+        throw std::runtime_error("curl_easy_init failed for media download");
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(raw, &curl_easy_cleanup);
+
+    curl_slist* raw_headers = nullptr;
+    for (const auto& header : headers)
+        raw_headers = curl_slist_append(raw_headers, header.c_str());
+    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_list(
+        raw_headers, &curl_slist_free_all);
+    std::array<char, CURL_ERROR_SIZE> error_buffer {};
+    DownloadProgressContext progress {&on_progress, &is_cancelled};
+
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, user_agent.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 12L);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, file.get());
+    curl_easy_setopt(curl.get(), CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, error_buffer.data());
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, DownloadProgress);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &progress);
+    if (header_list)
+        curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
+
+    const CURLcode result = curl_easy_perform(curl.get());
+    long status = 0;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
+    file.reset();
+    if (result != CURLE_OK || status < 200 || status >= 300)
+    {
+        std::remove(destination.c_str());
+        if (result == CURLE_ABORTED_BY_CALLBACK && is_cancelled && is_cancelled())
+            throw std::runtime_error("Advertisement download cancelled");
+        const std::string detail = error_buffer[0] != '\0'
+            ? std::string(error_buffer.data())
+            : std::string(curl_easy_strerror(result));
+        throw std::runtime_error(
+            "Advertisement download failed (HTTP " + std::to_string(status) +
+            "): " + detail);
+    }
 }
 
 int HttpClient::MeasureTcpHandshakeLatencyMs(

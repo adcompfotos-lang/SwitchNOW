@@ -190,7 +190,7 @@ class StartupGateView final : public brls::Box
                           "Refreshing authorization and verifying account access.");
                 AuthSession verified = client.RecoverSavedSession(
                     saved,
-                    true,
+                    false,
                     [this](const std::string& status) {
                         SetStatus("Signing in automatically", status);
                     },

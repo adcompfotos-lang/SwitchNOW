@@ -117,6 +117,45 @@ struct IceServerInfo
     std::string credential;
 };
 
+struct AdMediaFileInfo
+{
+    std::string url;
+    std::string encoding_profile;
+};
+
+struct SessionAdInfo
+{
+    std::string id;
+    int state = 0;
+    int duration_seconds = 0;
+    std::vector<AdMediaFileInfo> media_files;
+};
+
+struct AdBreakInfo
+{
+    bool required = false;
+    int provider = 0;
+    std::vector<SessionAdInfo> ads;
+};
+
+enum class SessionAdAction
+{
+    Start = 1,
+    Pause = 2,
+    Resume = 3,
+    Finish = 4,
+    Cancel = 5,
+};
+
+struct SessionAdReport
+{
+    std::string ad_id;
+    SessionAdAction action = SessionAdAction::Start;
+    int watched_time_ms = -1;
+    int paused_time_ms = -1;
+    std::string cancel_reason;
+};
+
 struct StreamRegion
 {
     std::string name;
@@ -141,6 +180,7 @@ struct SessionInfo
     std::string media_ip;
     int media_port = 0;
     std::vector<IceServerInfo> ice_servers;
+    AdBreakInfo ad_break;
 };
 
 } // namespace opennow

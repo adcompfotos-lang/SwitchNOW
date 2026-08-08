@@ -274,12 +274,15 @@ AuthSession GfnClient::LoginNative(
             if (code.empty())
                 throw std::runtime_error("NVIDIA native login did not return an authorization code");
 
-            AuthTokens tokens = ExchangeAuthorizationCode(http_client_, code, pkce.verifier);
-            RequestClientToken(http_client_, tokens);
+            // Keep the working NVIDIA TLS connection from authorize through token,
+            // client-token and user-info. Opening a second libnx curl handle here
+            // intermittently fails before HTTP on current login.nvidia.com edges.
+            AuthTokens tokens = ExchangeAuthorizationCode(native_http, code, pkce.verifier);
+            RequestClientToken(native_http, tokens);
             AuthSession auth_session;
             auth_session.provider = provider;
             auth_session.tokens = std::move(tokens);
-            auth_session.user = FetchUserInfo(http_client_, auth_session.tokens);
+            auth_session.user = FetchUserInfo(native_http, auth_session.tokens);
             auth_session.last_refresh_at_ms = NowMs();
             AppendAuthLog("auth-native: login complete");
             return auth_session;
@@ -581,7 +584,12 @@ AuthSession GfnClient::RecoverSavedSession(
     const std::function<void(const std::string&)>& report_status,
     const std::function<bool()>& is_cancelled) const
 {
-    if (session.reauthentication_required)
+    const bool can_refresh_tokens = auth::SelectRefreshMechanism(
+        !session.tokens.client_token.empty(),
+        !session.user.user_id.empty(),
+        !session.tokens.refresh_token.empty()) != auth::RefreshMechanism::None;
+
+    if (session.reauthentication_required && !can_refresh_tokens)
     {
         if (report_status)
             report_status("Restoring the remembered NVIDIA account.");
@@ -590,7 +598,10 @@ AuthSession GfnClient::RecoverSavedSession(
 
     try
     {
-        AuthSession recovered = force_refresh
+        // Older builds persisted reauthentication_required when they failed to use a
+        // perfectly valid client token. Treat that flag as a forced token check first,
+        // and only fall back to credentials if NVIDIA actually rejects the refresh.
+        AuthSession recovered = (force_refresh || session.reauthentication_required)
             ? ForceRefreshSavedSession(session)
             : EnsureFreshSavedSession(session);
         recovered.reauthentication_required = false;
@@ -645,14 +656,16 @@ AuthSession GfnClient::LoginSwitchQR(const LoginProvider& provider, std::functio
     if (code.empty())
         throw std::runtime_error("The GeForce NOW login callback did not include an authorization code");
 
-    AuthTokens tokens = ExchangeAuthorizationCode(http_client_, code, pkce.verifier);
+    NativeAuthHttpSession token_http;
+    WarmNvidiaTokenConnection(token_http);
+    AuthTokens tokens = ExchangeAuthorizationCode(token_http, code, pkce.verifier);
     AppendAuthLog("auth: token exchange ok");
-    RequestClientToken(http_client_, tokens);
+    RequestClientToken(token_http, tokens);
 
     AuthSession session;
     session.provider = provider;
     session.tokens   = tokens;
-    session.user     = FetchUserInfo(http_client_, tokens);
+    session.user     = FetchUserInfo(token_http, tokens);
     session.last_refresh_at_ms = NowMs();
     AppendAuthLog("auth: user info ok user_id_present=" + std::string(session.user.user_id.empty() ? "no" : "yes"));
     return session;
@@ -669,7 +682,11 @@ AuthSession GfnClient::EnsureFreshSession(const AuthSession& session) const
 
     AuthSession refreshed = session;
 
-    if (access_needs_refresh && session.tokens.refresh_token.empty())
+    const bool has_refresh_mechanism =
+        (!session.tokens.client_token.empty() && !session.user.user_id.empty()) ||
+        !session.tokens.refresh_token.empty();
+
+    if (access_needs_refresh && !has_refresh_mechanism)
     {
         if (IsExpired(session.tokens.expires_at_ms))
             throw ReauthenticationRequired("Saved GeForce NOW login has expired. Please sign in again.");
@@ -678,7 +695,7 @@ AuthSession GfnClient::EnsureFreshSession(const AuthSession& session) const
     {
         AppendAuthLog("auth: refreshing access token user_id_present=" +
                       std::string(session.user.user_id.empty() ? "no" : "yes"));
-        refreshed.tokens = RefreshTokens(http_client_, session);
+        refreshed.tokens = RefreshSessionTokensNative(session);
         refreshed.last_refresh_at_ms = NowMs();
         AppendAuthLog("auth: access token refresh ok");
     }
@@ -686,7 +703,7 @@ AuthSession GfnClient::EnsureFreshSession(const AuthSession& session) const
     if (refreshed.tokens.client_token.empty() ||
         IsNearExpiry(refreshed.tokens.client_token_expires_at_ms))
     {
-        RequestClientToken(http_client_, refreshed.tokens);
+        RequestClientTokenNative(refreshed.tokens);
     }
     return refreshed;
 }
@@ -727,11 +744,11 @@ AuthSession GfnClient::ForceRefreshSavedSession(const AuthSession& session) cons
     if (!session.persistence_enabled)
     {
         AuthSession refreshed = session;
-        refreshed.tokens = RefreshTokens(http_client_, session);
+        refreshed.tokens = RefreshSessionTokensNative(session);
         if (refreshed.tokens.client_token.empty() ||
             IsNearExpiry(refreshed.tokens.client_token_expires_at_ms))
         {
-            RequestClientToken(http_client_, refreshed.tokens);
+            RequestClientTokenNative(refreshed.tokens);
         }
         refreshed.last_refresh_at_ms = NowMs();
         return refreshed;
@@ -752,11 +769,11 @@ AuthSession GfnClient::ForceRefreshSavedSession(const AuthSession& session) cons
     AppendAuthLog("auth: forced refresh after authorization failure user_id_present=" +
                   std::string(source.user.user_id.empty() ? "no" : "yes"));
     AuthSession refreshed = source;
-    refreshed.tokens = RefreshTokens(http_client_, source);
+    refreshed.tokens = RefreshSessionTokensNative(source);
     if (refreshed.tokens.client_token.empty() ||
         IsNearExpiry(refreshed.tokens.client_token_expires_at_ms))
     {
-        RequestClientToken(http_client_, refreshed.tokens);
+        RequestClientTokenNative(refreshed.tokens);
     }
     refreshed.last_refresh_at_ms = NowMs();
     SaveSession(refreshed);
@@ -1130,4 +1147,3 @@ bool LoadLegacySession(AuthSession& session)
 
     return false;
 }
-

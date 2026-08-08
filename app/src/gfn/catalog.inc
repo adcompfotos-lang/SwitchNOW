@@ -287,14 +287,16 @@ AuthSession GfnClient::Login(const LoginProvider& provider, const std::string& l
     if (code.empty())
         throw std::runtime_error("The GeForce NOW login callback did not include an authorization code");
 
-    AuthTokens tokens = ExchangeAuthorizationCode(http_client_, code, pkce.verifier);
+    NativeAuthHttpSession token_http;
+    WarmNvidiaTokenConnection(token_http);
+    AuthTokens tokens = ExchangeAuthorizationCode(token_http, code, pkce.verifier);
     AppendAuthLog("auth: token exchange ok");
-    RequestClientToken(http_client_, tokens);
+    RequestClientToken(token_http, tokens);
 
     AuthSession session;
     session.provider = provider;
     session.tokens   = tokens;
-    session.user     = FetchUserInfo(http_client_, tokens);
+    session.user     = FetchUserInfo(token_http, tokens);
     session.last_refresh_at_ms = NowMs();
     AppendAuthLog("auth: user info ok user_id_present=" + std::string(session.user.user_id.empty() ? "no" : "yes"));
     return session;

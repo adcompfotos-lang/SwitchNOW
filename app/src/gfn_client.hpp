@@ -76,6 +76,10 @@ class GfnClient
                              const std::string& internal_title = "",
                              bool force_provider_endpoint = false) const;
     SessionInfo PollSession(AuthSession& session, const std::string& session_id) const;
+    SessionInfo ReportSessionAd(
+        AuthSession& session,
+        const std::string& session_id,
+        const SessionAdReport& report) const;
     void StopSession(
         AuthSession& session,
         const std::string& session_id,

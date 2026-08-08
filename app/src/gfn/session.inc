@@ -222,6 +222,7 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
             info.queue_position = json_integer_value(qp);
 
         ApplySeatSetupInfo(sess, info);
+        ApplySessionAds(sess, info);
 
         ApplySessionNetworkInfo(sess, info);
     }
@@ -395,6 +396,7 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
             info.queue_position = json_integer_value(qp);
 
         ApplySeatSetupInfo(sess, info);
+        ApplySessionAds(sess, info);
             
         ApplySessionNetworkInfo(sess, info);
     }
@@ -408,6 +410,131 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
     if (app_patching)
         AppendSessionTraceLog("POLL pending reason=app_patching");
     AppendSessionTraceLog("POLL parsed: " + SessionInfoTraceSummary(info));
+    return info;
+}
+
+SessionInfo GfnClient::ReportSessionAd(
+    AuthSession& session,
+    const std::string& session_id,
+    const SessionAdReport& report) const
+{
+    if (session_id.empty() || report.ad_id.empty())
+        throw std::runtime_error("Cannot report an advertisement without a session and ad ID");
+
+    session = EnsureFreshSavedSession(session);
+    std::string jwt_token = ResolveSessionJwt(session);
+    const std::string active_base_url =
+        LoadActiveCloudSessionBaseUrl(session, session_id);
+    const std::string base_url = active_base_url.empty()
+        ? server_location::ResolveStreamingBaseUrl(
+              "Auto", session.provider.streaming_service_url)
+        : active_base_url;
+    const std::string url = base_url + "v2/session/" + session_id;
+
+    std::vector<std::string> headers = {
+        "Authorization: GFNJWT " + jwt_token,
+        "nv-client-id: " + client_id_,
+        "nv-browser-type: CHROME",
+        "nv-client-streamer: NVIDIA-CLASSIC",
+        "nv-client-type: NATIVE",
+        "nv-client-version: 30.0",
+        "nv-device-make: UNKNOWN",
+        "nv-device-model: UNKNOWN",
+        "nv-device-os: WINDOWS",
+        "nv-device-type: DESKTOP",
+        "x-device-id: " + device_id_,
+        "Content-Type: application/json",
+        "Origin: https://play.geforcenow.com",
+        "Referer: https://play.geforcenow.com/",
+    };
+
+    JsonPtr update(json_object(), &json_decref);
+    json_object_set_new(update.get(), "adId", json_string(report.ad_id.c_str()));
+    json_object_set_new(
+        update.get(), "adAction",
+        json_integer(static_cast<int>(report.action)));
+    json_object_set_new(
+        update.get(), "clientTimestamp",
+        json_integer(static_cast<json_int_t>(std::time(nullptr))));
+    if (report.watched_time_ms >= 0)
+        json_object_set_new(
+            update.get(), "watchedTimeInMs",
+            json_integer(report.watched_time_ms));
+    if (report.paused_time_ms >= 0)
+        json_object_set_new(
+            update.get(), "pausedTimeInMs",
+            json_integer(report.paused_time_ms));
+    if (!report.cancel_reason.empty())
+        json_object_set_new(
+            update.get(), "cancelReason",
+            json_string(report.cancel_reason.c_str()));
+
+    JsonPtr updates(json_array(), &json_decref);
+    json_array_append_new(updates.get(), json_incref(update.get()));
+    JsonPtr request(json_object(), &json_decref);
+    json_object_set_new(request.get(), "action", json_integer(6));
+    json_object_set_new(request.get(), "adUpdates", json_incref(updates.get()));
+    const std::string body = DumpJson(request.get());
+
+    AppendSessionTraceLog(
+        "AD update action=" +
+        std::to_string(static_cast<int>(report.action)) +
+        " watchedMs=" + std::to_string(report.watched_time_ms) +
+        " pausedMs=" + std::to_string(report.paused_time_ms));
+    HttpResponse response = http_client_.Request(
+        "PUT", url, kUserAgent, headers, body);
+    if (response.status_code == 401)
+    {
+        session = ForceRefreshSavedSession(session);
+        jwt_token = ResolveSessionJwt(session);
+        headers[0] = "Authorization: GFNJWT " + jwt_token;
+        response = http_client_.Request(
+            "PUT", url, kUserAgent, headers, body);
+    }
+
+    JsonPtr root(nullptr, &json_decref);
+    try
+    {
+        root = LoadJson(response.body);
+    }
+    catch (const std::exception& e)
+    {
+        AppendSessionTraceLog(
+            "AD update JSON parse error=" + std::string(e.what()));
+    }
+
+    json_t* request_status =
+        root ? json_object_get(root.get(), "requestStatus") : nullptr;
+    if (response.status_code < 200 || response.status_code >= 300 ||
+        !request_status || GetInteger(request_status, "statusCode") != 1)
+    {
+        const std::string error = root
+            ? BuildCloudMatchErrorMessage(
+                  "ReportSessionAd", response.status_code, root.get())
+            : "ReportSessionAd failed with HTTP " +
+                  std::to_string(response.status_code) + SessionTraceHint();
+        AppendSessionTraceLog("AD update failed: " + error);
+        throw std::runtime_error(error);
+    }
+
+    SessionInfo info;
+    info.session_id = session_id;
+    CollectIceServersFromObject(root.get(), info);
+    json_t* sess = json_object_get(root.get(), "session");
+    if (sess)
+    {
+        json_t* status = json_object_get(sess, "status");
+        if (status)
+            info.status = ParseSessionStatus(status);
+        info.queue_position = GetInteger(sess, "queuePosition");
+        ApplySeatSetupInfo(sess, info);
+        ApplySessionAds(sess, info);
+        ApplySessionNetworkInfo(sess, info);
+    }
+    json_t* root_qp = json_object_get(root.get(), "queuePosition");
+    if (root_qp && json_is_integer(root_qp))
+        info.queue_position = json_integer_value(root_qp);
+    AppendSessionTraceLog("AD update accepted: " + SessionInfoTraceSummary(info));
     return info;
 }
 

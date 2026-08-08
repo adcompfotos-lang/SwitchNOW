@@ -119,10 +119,11 @@ target_link_libraries(${PROJECT_NAME}
         -lavutil
         -lswresample
         z
+        bz2
 )
 
 set(PROJECT_AUTHOR "OpenCloudGaming")
-set(PROJECT_VERSION_STRING "1.1.5")
+set(PROJECT_VERSION_STRING "1.1.7")
 set(PROJECT_TITLEID "05004F4E4F575358")
 set(PROJECT_ICON ${CMAKE_CURRENT_SOURCE_DIR}/resources/icon/icon.jpg)
 set(PROJECT_ROMFS_DIR ${CMAKE_BINARY_DIR}/romfs)

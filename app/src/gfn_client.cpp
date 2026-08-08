@@ -1,4 +1,5 @@
 #include "gfn_client.hpp"
+#include "ad_break_policy.hpp"
 #include "cloud_session_policy.hpp"
 #include "device_identity.hpp"
 #include "play_history.hpp"
@@ -730,7 +731,8 @@ bool IsSensitiveJsonKey(const std::string& key)
            lower.find("credential") != std::string::npos ||
            lower.find("password") != std::string::npos ||
            lower.find("secret") != std::string::npos ||
-           lower.find("jwt") != std::string::npos;
+           lower.find("jwt") != std::string::npos ||
+           lower == "adid" || lower == "adurl" || lower == "mediafileurl";
 }
 
 void RedactJsonInPlace(json_t* value)
@@ -871,6 +873,13 @@ std::string BuildCloudMatchErrorMessage(const std::string& stage, int http_statu
                    "SwitchNOW tried to close it automatically. Wait about a minute and retry "
                    "if NVIDIA is still releasing the previous cloud rig.";
     }
+    if (request_status && ad_break::IsWaitingAdsTimeout(
+            GetInteger(request_status, "statusCode"),
+            GetString(request_status, "statusDescription"))) {
+        message += "\nNVIDIA ended this Free-tier launch because its required advertisement "
+                   "did not complete. Retry the launch; SwitchNOW will play the ad and report "
+                   "its real playback progress before continuing to the cloud rig.";
+    }
     return message + SessionTraceHint();
 }
 
@@ -924,6 +933,74 @@ void ApplySeatSetupInfo(json_t* sess, SessionInfo& info)
     json_t* queue_position = json_object_get(seat_setup, "queuePosition");
     if (queue_position && json_is_integer(queue_position))
         info.queue_position = json_integer_value(queue_position);
+}
+
+void ApplySessionAds(json_t* sess, SessionInfo& info)
+{
+    if (!sess || !json_is_object(sess))
+        return;
+
+    info.ad_break.required = GetBool(sess, "sessionAdsRequired");
+    info.ad_break.provider = GetInteger(sess, "adProvider");
+
+    json_t* ads = json_object_get(sess, "sessionAds");
+    if (!ads || !json_is_array(ads))
+        return;
+
+    // ReportSessionAd responses replace the current break. Never append a
+    // refreshed server list to metadata retained by the caller.
+    info.ad_break.ads.clear();
+
+    if (json_array_size(ads) > 0)
+        info.ad_break.required = true;
+
+    size_t ad_index = 0;
+    json_t* ad_object = nullptr;
+    json_array_foreach(ads, ad_index, ad_object)
+    {
+        if (!ad_object || !json_is_object(ad_object))
+            continue;
+
+        SessionAdInfo ad;
+        ad.id = GetString(ad_object, "adId");
+        ad.state = GetInteger(ad_object, "adState");
+        ad.duration_seconds = GetInteger(ad_object, "adLengthInSeconds");
+
+        json_t* media_files = json_object_get(ad_object, "adMediaFiles");
+        if (media_files && json_is_array(media_files))
+        {
+            size_t media_index = 0;
+            json_t* media_object = nullptr;
+            json_array_foreach(media_files, media_index, media_object)
+            {
+                if (!media_object || !json_is_object(media_object))
+                    continue;
+
+                AdMediaFileInfo media;
+                media.url = GetString(media_object, "mediaFileUrl");
+                if (media.url.empty())
+                    media.url = GetString(media_object, "url");
+                if (media.url.empty())
+                    media.url = GetString(media_object, "adUrl");
+                if (media.url.empty())
+                    media.url = GetString(media_object, "mediaUrl");
+                media.encoding_profile = GetString(media_object, "encodingProfile");
+                if (media.encoding_profile.empty())
+                    media.encoding_profile = GetString(media_object, "profile");
+                if (!media.url.empty())
+                    ad.media_files.push_back(std::move(media));
+            }
+        }
+
+        if (ad.media_files.empty())
+        {
+            const std::string fallback_url = GetString(ad_object, "adUrl");
+            if (!fallback_url.empty())
+                ad.media_files.push_back({fallback_url, "default"});
+        }
+
+        info.ad_break.ads.push_back(std::move(ad));
+    }
 }
 
 std::string GenerateDeviceId()
@@ -1284,9 +1361,14 @@ class NativeAuthHttpSession
         const std::vector<std::string>& headers = {},
         const std::string& body = {})
     {
+        const std::string safe_url = SanitizeRuntimeUrl(url);
+        const auto operation_id = BeginRuntimeOperation(
+            "auth_transport", method, "url=" + safe_url + " connection=reused");
+        const auto started_at = std::chrono::steady_clock::now();
         curl_easy_reset(curl_.get());
         response_body_.clear();
         response_location_.clear();
+        error_buffer_.fill('\0');
 
         curl_slist* raw_headers = nullptr;
         for (const auto& header : headers)
@@ -1302,6 +1384,7 @@ class NativeAuthHttpSession
         curl_easy_setopt(curl_.get(), CURLOPT_ACCEPT_ENCODING, "");
         curl_easy_setopt(curl_.get(), CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl_.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+        curl_easy_setopt(curl_.get(), CURLOPT_ERRORBUFFER, error_buffer_.data());
         curl_easy_setopt(curl_.get(), CURLOPT_COOKIEFILE, "");
         curl_easy_setopt(curl_.get(), CURLOPT_WRITEFUNCTION, &NativeAuthHttpSession::WriteBody);
         curl_easy_setopt(curl_.get(), CURLOPT_WRITEDATA, this);
@@ -1323,11 +1406,39 @@ class NativeAuthHttpSession
 
         const CURLcode rc = curl_easy_perform(curl_.get());
         if (rc != CURLE_OK)
+        {
+            char* primary_ip = nullptr;
+            curl_easy_getinfo(curl_.get(), CURLINFO_PRIMARY_IP, &primary_ip);
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started_at).count();
+            const std::string detail =
+                "url=" + safe_url +
+                " curl_code=" + std::to_string(static_cast<int>(rc)) +
+                " curl_error=" +
+                    (error_buffer_[0] ? std::string(error_buffer_.data())
+                                      : std::string(curl_easy_strerror(rc))) +
+                " elapsed_ms=" + std::to_string(elapsed_ms) +
+                " primary_ip=" + (primary_ip ? std::string(primary_ip) : std::string("unknown"));
+            EndRuntimeOperation(operation_id, "auth_transport", method, "error", detail);
+            AppendAuthLog("auth-transport: " + detail);
             throw std::runtime_error(
-                std::string("Native NVIDIA login network error: ") + curl_easy_strerror(rc));
+                std::string("Native NVIDIA login network error: ") +
+                (error_buffer_[0] ? error_buffer_.data() : curl_easy_strerror(rc)));
+        }
 
         long status_code = 0;
         curl_easy_getinfo(curl_.get(), CURLINFO_RESPONSE_CODE, &status_code);
+        char* primary_ip = nullptr;
+        curl_easy_getinfo(curl_.get(), CURLINFO_PRIMARY_IP, &primary_ip);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started_at).count();
+        EndRuntimeOperation(
+            operation_id, "auth_transport", method, "ok",
+            "url=" + safe_url +
+                " status=" + std::to_string(status_code) +
+                " bytes=" + std::to_string(response_body_.size()) +
+                " elapsed_ms=" + std::to_string(elapsed_ms) +
+                " primary_ip=" + (primary_ip ? std::string(primary_ip) : std::string("unknown")));
         return {status_code, response_body_, response_location_};
     }
 
@@ -1358,6 +1469,7 @@ class NativeAuthHttpSession
     }
 
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl_;
+    std::array<char, CURL_ERROR_SIZE> error_buffer_ {};
     std::string response_body_;
     std::string response_location_;
 };
@@ -1786,8 +1898,24 @@ AuthTokens ParseAuthTokens(json_t* payload)
     return tokens;
 }
 
+void WarmNvidiaTokenConnection(
+    NativeAuthHttpSession& session,
+    const std::string& access_token = {})
+{
+    // libnx curl 7.69 can fail a fresh POST handshake to login.nvidia.com even though
+    // the interactive authorize connection is healthy. A verified GET on the same
+    // easy handle establishes the TLS session that the token POST can safely reuse.
+    const std::string url = access_token.empty() ? kAuthorizeEndpoint : kUserInfoEndpoint;
+    const auto headers = BuildNvidiaAuthHeaders(
+        access_token, {}, false, access_token.empty() ? "text/html,application/json" : "application/json");
+    const NativeAuthResponse response = session.Request("GET", url, headers);
+    AppendAuthLog(
+        "auth-transport: preflight complete endpoint=" + SanitizeRuntimeUrl(url) +
+        " HTTP=" + std::to_string(response.status_code));
+}
+
 AuthTokens ExchangeAuthorizationCode(
-    const HttpClient& http_client,
+    NativeAuthHttpSession& session,
     const std::string& code,
     const std::string& verifier,
     const std::string& redirect_uri = std::string(kRedirectUri))
@@ -1798,12 +1926,11 @@ AuthTokens ExchangeAuthorizationCode(
         "&redirect_uri=" + UrlEncode(redirect_uri, true) +
         "&code_verifier=" + UrlEncode(verifier, true);
 
-    const HttpResponse response = http_client.Post(
+    const NativeAuthResponse response = session.Request(
+        "POST",
         kTokenEndpoint,
-        GfnClient::kUserAgent,
         BuildNvidiaAuthHeaders({}, "application/x-www-form-urlencoded; charset=UTF-8", true),
         body);
-
     if (response.status_code != 200)
     {
         AppendAuthLog(
@@ -1814,117 +1941,231 @@ AuthTokens ExchangeAuthorizationCode(
     }
 
     JsonPtr root = LoadJson(response.body);
+    AppendAuthLog("auth-transport: authorization code exchanged on persistent connection");
     return ParseAuthTokens(root.get());
 }
 
-AuthTokens RefreshTokens(const HttpClient& http_client, const AuthSession& session)
+void RequestClientToken(NativeAuthHttpSession& session, AuthTokens& tokens);
+
+AuthTokens MergeRefreshedTokens(AuthTokens tokens, const AuthSession& auth_session)
 {
-    if (session.tokens.refresh_token.empty())
-        throw std::runtime_error("Saved GeForce NOW session cannot be refreshed");
+    if (tokens.refresh_token.empty())
+        tokens.refresh_token = auth_session.tokens.refresh_token;
+    if (tokens.id_token.empty())
+        tokens.id_token = auth_session.tokens.id_token;
+    if (tokens.client_token.empty())
+    {
+        tokens.client_token = auth_session.tokens.client_token;
+        tokens.client_token_expires_at_ms = auth_session.tokens.client_token_expires_at_ms;
+    }
+    else if (tokens.client_token != auth_session.tokens.client_token)
+    {
+        // The OAuth response does not describe the lifetime of a rotated client token.
+        // Force /client_token to return authoritative lifetime metadata below.
+        tokens.client_token_expires_at_ms = 0;
+    }
+    return tokens;
+}
 
-    const std::string body =
-        "grant_type=refresh_token"
-        "&refresh_token=" + UrlEncode(session.tokens.refresh_token, true) +
-        "&client_id=" + UrlEncode(kClientId, true);
-
-    HttpResponse response;
+NativeAuthResponse PostTokenGrant(
+    NativeAuthHttpSession& session,
+    const std::string& body,
+    const std::string& grant_name)
+{
+    NativeAuthResponse response;
     for (int attempt = 1; attempt <= 3; ++attempt)
     {
-        response = http_client.Post(
+        response = session.Request(
+            "POST",
             kTokenEndpoint,
-            GfnClient::kUserAgent,
             BuildNvidiaAuthHeaders({}, "application/x-www-form-urlencoded; charset=UTF-8"),
             body);
         const bool temporary = auth::IsTemporaryHttpStatus(response.status_code);
         if (response.status_code == 200 || !temporary || attempt == 3)
             break;
-
-        AppendAuthLog("auth: token refresh temporary failure HTTP " +
-                      std::to_string(response.status_code) +
-                      " retry=" + std::to_string(attempt));
+        AppendAuthLog(
+            "auth: " + grant_name + " temporary failure HTTP " +
+            std::to_string(response.status_code) + " retry=" + std::to_string(attempt));
         std::this_thread::sleep_for(
             std::chrono::milliseconds(auth::RefreshRetryDelayMs(attempt)));
     }
+    return response;
+}
 
+AuthTokens RefreshTokensWithClientTokenNative(const AuthSession& auth_session)
+{
+    if (auth_session.tokens.client_token.empty() || auth_session.user.user_id.empty())
+        throw std::runtime_error("Saved session has no client-token refresh mechanism");
+
+    NativeAuthHttpSession session;
+    // Only warm login.nvidia.com. Following /authorize to accounts.nvgs is unnecessary
+    // for token refresh and can fail against the older libnx certificate store.
+    WarmNvidiaTokenConnection(session);
+    const std::string body =
+        "grant_type=" + UrlEncode("urn:ietf:params:oauth:grant-type:client_token", true) +
+        "&client_token=" + UrlEncode(auth_session.tokens.client_token, true) +
+        "&client_id=" + UrlEncode(kClientId, true) +
+        "&sub=" + UrlEncode(auth_session.user.user_id, true);
+
+    const NativeAuthResponse response = PostTokenGrant(session, body, "client-token refresh");
     if (response.status_code != 200)
     {
-        AppendAuthLog("auth: token refresh failed HTTP " + std::to_string(response.status_code));
+        AppendAuthLog(
+            "auth: client-token refresh rejected HTTP " +
+            std::to_string(response.status_code));
         if (response.status_code == 400 || response.status_code == 401)
-            throw ReauthenticationRequired("Saved GeForce NOW login is no longer valid. Please sign in again.");
+            throw ReauthenticationRequired("Saved NVIDIA client token is no longer valid");
         throw std::runtime_error(
-            "Could not refresh the saved login (HTTP " + std::to_string(response.status_code) + "). Please try again.");
+            "Client-token refresh failed with HTTP " + std::to_string(response.status_code));
     }
 
-    JsonPtr root      = LoadJson(response.body);
-    AuthTokens tokens = ParseAuthTokens(root.get());
-    if (tokens.refresh_token.empty())
-        tokens.refresh_token = session.tokens.refresh_token;
-
-    if (tokens.client_token.empty())
-    {
-        tokens.client_token              = session.tokens.client_token;
-        tokens.client_token_expires_at_ms = session.tokens.client_token_expires_at_ms;
-    }
-
+    JsonPtr root = LoadJson(response.body);
+    AuthTokens tokens = MergeRefreshedTokens(ParseAuthTokens(root.get()), auth_session);
+    if (tokens.client_token.empty() || IsNearExpiry(tokens.client_token_expires_at_ms))
+        RequestClientToken(session, tokens);
+    AppendAuthLog("auth: client-token refresh ok");
     return tokens;
 }
 
-void RequestClientToken(const HttpClient& http_client, AuthTokens& tokens)
+AuthTokens RefreshTokensWithOAuthNative(const AuthSession& auth_session)
+{
+    if (auth_session.tokens.refresh_token.empty())
+        throw std::runtime_error("Saved GeForce NOW session cannot be refreshed");
+
+    NativeAuthHttpSession session;
+    WarmNvidiaTokenConnection(session);
+    const std::string body =
+        "grant_type=refresh_token"
+        "&refresh_token=" + UrlEncode(auth_session.tokens.refresh_token, true) +
+        "&client_id=" + UrlEncode(kClientId, true);
+
+    const NativeAuthResponse response = PostTokenGrant(session, body, "OAuth refresh");
+
+    if (response.status_code != 200)
+    {
+        AppendAuthLog(
+            "auth: native token refresh failed HTTP " + std::to_string(response.status_code));
+        if (response.status_code == 400 || response.status_code == 401)
+            throw ReauthenticationRequired(
+                "Saved GeForce NOW login is no longer valid. Please sign in again.");
+        throw std::runtime_error(
+            "Could not refresh the saved login (HTTP " +
+            std::to_string(response.status_code) + "). Please try again.");
+    }
+
+    JsonPtr root = LoadJson(response.body);
+    AuthTokens tokens = MergeRefreshedTokens(ParseAuthTokens(root.get()), auth_session);
+    if (tokens.client_token.empty() || IsNearExpiry(tokens.client_token_expires_at_ms))
+        RequestClientToken(session, tokens);
+    AppendAuthLog("auth: OAuth refresh ok");
+    return tokens;
+}
+
+AuthTokens RefreshSessionTokensNative(const AuthSession& auth_session)
+{
+    const auto mechanism = auth::SelectRefreshMechanism(
+        !auth_session.tokens.client_token.empty(),
+        !auth_session.user.user_id.empty(),
+        !auth_session.tokens.refresh_token.empty());
+
+    const char* mechanism_name = "none";
+    if (mechanism == auth::RefreshMechanism::ClientToken)
+        mechanism_name = "client_token";
+    else if (mechanism == auth::RefreshMechanism::OAuthRefreshToken)
+        mechanism_name = "oauth_refresh_token";
+    AppendAuthLog(
+        "auth: refresh mechanism=" + std::string(mechanism_name) +
+        " client=" +
+            std::string(auth_session.tokens.client_token.empty() ? "missing" : "present") +
+        " user=" + std::string(auth_session.user.user_id.empty() ? "missing" : "present") +
+        " oauth=" +
+            std::string(auth_session.tokens.refresh_token.empty() ? "missing" : "present"));
+
+    if (mechanism == auth::RefreshMechanism::ClientToken)
+    {
+        try
+        {
+            return RefreshTokensWithClientTokenNative(auth_session);
+        }
+        catch (const ReauthenticationRequired& ex)
+        {
+            AppendAuthLog(
+                "auth: client-token refresh rejected; OAuth fallback=" +
+                std::string(auth_session.tokens.refresh_token.empty() ? "missing" : "available"));
+            if (auth_session.tokens.refresh_token.empty())
+                throw;
+        }
+        catch (const std::exception& ex)
+        {
+            AppendAuthLog(
+                "auth: client-token refresh failed; OAuth fallback=" +
+                std::string(auth_session.tokens.refresh_token.empty() ? "missing" : "available") +
+                " error=" + ex.what());
+            if (auth_session.tokens.refresh_token.empty())
+                throw;
+        }
+    }
+
+    if (!auth_session.tokens.refresh_token.empty())
+        return RefreshTokensWithOAuthNative(auth_session);
+
+    throw ReauthenticationRequired(
+        "Saved GeForce NOW session has no usable refresh mechanism. Please sign in again.");
+}
+
+void RequestClientToken(NativeAuthHttpSession& session, AuthTokens& tokens)
 {
     if (tokens.access_token.empty())
         return;
-
-    const HttpResponse response = http_client.Get(
-        kClientTokenEndpoint,
-        GfnClient::kUserAgent,
-        BuildNvidiaAuthHeaders(tokens.access_token));
-
+    const NativeAuthResponse response = session.Request(
+        "GET", kClientTokenEndpoint, BuildNvidiaAuthHeaders(tokens.access_token));
     if (response.status_code != 200)
+    {
+        AppendAuthLog(
+            "auth: client token request skipped HTTP " + std::to_string(response.status_code));
         return;
-
+    }
     JsonPtr root = LoadJson(response.body);
     const std::string client_token = GetString(root.get(), "client_token");
     if (client_token.empty())
         return;
-
-    tokens.client_token               = client_token;
+    tokens.client_token = client_token;
     tokens.client_token_expires_at_ms = ToExpiresAtMs(root.get(), "expires_in");
 }
 
-AuthUser FetchUserInfo(const HttpClient& http_client, const AuthTokens& tokens)
+void RequestClientTokenNative(AuthTokens& tokens)
 {
-    const HttpResponse response = http_client.Get(
-        kUserInfoEndpoint,
-        GfnClient::kUserAgent,
-        BuildNvidiaAuthHeaders(tokens.access_token, {}, false, "application/json"));
+    NativeAuthHttpSession session;
+    WarmNvidiaTokenConnection(session, tokens.access_token);
+    RequestClientToken(session, tokens);
+}
 
+AuthUser FetchUserInfo(NativeAuthHttpSession& session, const AuthTokens& tokens)
+{
+    const NativeAuthResponse response = session.Request(
+        "GET",
+        kUserInfoEndpoint,
+        BuildNvidiaAuthHeaders(tokens.access_token, {}, false, "application/json"));
     if (response.status_code != 200)
-    {
         throw std::runtime_error(
             "Failed to fetch user info with HTTP " + std::to_string(response.status_code));
-    }
 
     JsonPtr root = LoadJson(response.body);
     AuthUser user;
-    user.user_id         = GetString(root.get(), "sub");
-    user.display_name    = GetString(root.get(), "preferred_username");
-    user.email           = GetString(root.get(), "email");
-    user.avatar_url      = GetString(root.get(), "picture");
+    user.user_id = GetString(root.get(), "sub");
+    user.display_name = GetString(root.get(), "preferred_username");
+    user.email = GetString(root.get(), "email");
+    user.avatar_url = GetString(root.get(), "picture");
     user.membership_tier = "FREE";
-
     if (user.display_name.empty() && !user.email.empty())
     {
         const auto at = user.email.find('@');
-        user.display_name =
-            at == std::string::npos ? user.email : user.email.substr(0, at);
+        user.display_name = at == std::string::npos ? user.email : user.email.substr(0, at);
     }
-
     if (user.display_name.empty())
         user.display_name = "GFN User";
-
     if (user.user_id.empty())
         throw std::runtime_error("Login succeeded but user info is incomplete");
-
     return user;
 }
 

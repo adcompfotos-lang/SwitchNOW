@@ -14,6 +14,18 @@ static_assert(opennow::auth::IsTemporaryHttpStatus(503));
 static_assert(!opennow::auth::IsTemporaryHttpStatus(401));
 static_assert(opennow::auth::RefreshRetryDelayMs(1) == 500);
 static_assert(opennow::auth::RefreshRetryDelayMs(2) == 1500);
+static_assert(
+    opennow::auth::SelectRefreshMechanism(true, true, false) ==
+    opennow::auth::RefreshMechanism::ClientToken);
+static_assert(
+    opennow::auth::SelectRefreshMechanism(false, true, true) ==
+    opennow::auth::RefreshMechanism::OAuthRefreshToken);
+static_assert(
+    opennow::auth::SelectRefreshMechanism(true, false, true) ==
+    opennow::auth::RefreshMechanism::OAuthRefreshToken);
+static_assert(
+    opennow::auth::SelectRefreshMechanism(false, false, false) ==
+    opennow::auth::RefreshMechanism::None);
 
 int main()
 {

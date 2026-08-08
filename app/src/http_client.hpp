@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace opennow
 {
@@ -36,6 +37,14 @@ class HttpClient
         const std::string& user_agent,
         const std::vector<std::string>& headers,
         const std::string& body) const;
+
+    void DownloadToFile(
+        const std::string& url,
+        const std::string& destination,
+        const std::string& user_agent,
+        const std::vector<std::string>& headers = {},
+        const std::function<void(long long, long long)>& on_progress = {},
+        const std::function<bool()>& is_cancelled = {}) const;
 
     int MeasureTcpHandshakeLatencyMs(
         const std::string& url,

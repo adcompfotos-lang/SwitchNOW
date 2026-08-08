@@ -22,6 +22,8 @@ native WebRTC signaling, H.264 video, Opus audio and low-latency input delivery.
 - Persistent multi-account sign-in, token refresh and optional encrypted local
   password storage for quick sign-in and automatic account recovery.
 - Animated queue, setup and connection stages while a cloud rig is prepared.
+- Free-tier advertisement playback with real media progress and official
+  session continuation; no-ad launches retain the original fast path.
 - Tegra X1 NVDEC hardware decoding with automatic software-decoder fallback.
 - Bounded low-latency decode queues, damaged-frame suppression, RTCP recovery
   and keyframe resynchronization after packet loss.
@@ -175,7 +177,7 @@ build/switch/SwitchNOW.nro
 Create a conventional release archive:
 
 ```powershell
-.\scripts\package-release.ps1 -Version 1.1.5
+.\scripts\package-release.ps1 -Version 1.1.7
 ```
 
 ## Source layout
