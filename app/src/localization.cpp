@@ -582,6 +582,324 @@ const Dictionary& CompletionDictionaryFor(const std::string& code)
     return found == dictionaries.end() ? empty : found->second;
 }
 
+const Dictionary& SearchAndLaunchDictionaryFor(const std::string& code)
+{
+    static const Dictionary empty;
+    static const std::unordered_map<std::string, Dictionary> dictionaries = {
+        {"ru", {
+            {"All", "\u0412\u0441\u0435"},
+            {"Clear search", "\u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u043f\u043e\u0438\u0441\u043a"},
+            {"Search Library", "\u041f\u043e\u0438\u0441\u043a \u0432 \u0431\u0438\u0431\u043b\u0438\u043e\u0442\u0435\u043a\u0435"},
+            {"Enter a title to filter your games", "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435 \u0438\u0433\u0440\u044b"},
+            {"Search Catalog", "\u041f\u043e\u0438\u0441\u043a \u0432 \u043a\u0430\u0442\u0430\u043b\u043e\u0433\u0435"},
+            {"Enter a title to filter games", "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435 \u0438\u0433\u0440\u044b"},
+            {"Searching for: {0}", "\u041f\u043e\u0438\u0441\u043a: {0}"},
+            {"B  Clear search", "B  \u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u043f\u043e\u0438\u0441\u043a"},
+            {"QUEUE", "\u041e\u0427\u0415\u0420\u0415\u0414\u042c"},
+            {"SETUP", "\u041d\u0410\u0421\u0422\u0420\u041e\u0419\u041a\u0410"},
+            {"READY", "\u0413\u041e\u0422\u041e\u0412\u041e"},
+        }},
+        {"uk", {
+            {"All", "\u0423\u0441\u0456"},
+            {"Clear search", "\u041e\u0447\u0438\u0441\u0442\u0438\u0442\u0438 \u043f\u043e\u0448\u0443\u043a"},
+            {"Search Library", "\u041f\u043e\u0448\u0443\u043a \u0443 \u0431\u0456\u0431\u043b\u0456\u043e\u0442\u0435\u0446\u0456"},
+            {"Enter a title to filter your games", "\u0412\u0432\u0435\u0434\u0456\u0442\u044c \u043d\u0430\u0437\u0432\u0443 \u0433\u0440\u0438"},
+            {"Search Catalog", "\u041f\u043e\u0448\u0443\u043a \u0443 \u043a\u0430\u0442\u0430\u043b\u043e\u0437\u0456"},
+            {"Enter a title to filter games", "\u0412\u0432\u0435\u0434\u0456\u0442\u044c \u043d\u0430\u0437\u0432\u0443 \u0433\u0440\u0438"},
+            {"Searching for: {0}", "\u041f\u043e\u0448\u0443\u043a: {0}"},
+            {"B  Clear search", "B  \u041e\u0447\u0438\u0441\u0442\u0438\u0442\u0438 \u043f\u043e\u0448\u0443\u043a"},
+            {"QUEUE", "\u0427\u0415\u0420\u0413\u0410"},
+            {"SETUP", "\u041d\u0410\u041b\u0410\u0428\u0422\u0423\u0412\u0410\u041d\u041d\u042f"},
+            {"READY", "\u0413\u041e\u0422\u041e\u0412\u041e"},
+        }},
+        {"es", {
+            {"All", "Todos"}, {"Clear search", "Borrar b\u00fasqueda"},
+            {"Search Library", "Buscar en la biblioteca"},
+            {"Enter a title to filter your games", "Introduce el t\u00edtulo de un juego"},
+            {"Search Catalog", "Buscar en el cat\u00e1logo"},
+            {"Enter a title to filter games", "Introduce el t\u00edtulo de un juego"},
+            {"Searching for: {0}", "Buscando: {0}"},
+            {"B  Clear search", "B  Borrar b\u00fasqueda"},
+            {"QUEUE", "COLA"}, {"SETUP", "CONFIGURACI\u00d3N"}, {"READY", "LISTO"},
+        }},
+        {"it", {
+            {"All", "Tutti"}, {"Clear search", "Cancella ricerca"},
+            {"Search Library", "Cerca nella libreria"},
+            {"Enter a title to filter your games", "Inserisci il titolo di un gioco"},
+            {"Search Catalog", "Cerca nel catalogo"},
+            {"Enter a title to filter games", "Inserisci il titolo di un gioco"},
+            {"Searching for: {0}", "Ricerca: {0}"},
+            {"B  Clear search", "B  Cancella ricerca"},
+            {"QUEUE", "CODA"}, {"SETUP", "CONFIGURAZIONE"}, {"READY", "PRONTO"},
+        }},
+        {"fr", {
+            {"All", "Tous"}, {"Clear search", "Effacer la recherche"},
+            {"Search Library", "Rechercher dans la biblioth\u00e8que"},
+            {"Enter a title to filter your games", "Saisissez le titre d'un jeu"},
+            {"Search Catalog", "Rechercher dans le catalogue"},
+            {"Enter a title to filter games", "Saisissez le titre d'un jeu"},
+            {"Searching for: {0}", "Recherche : {0}"},
+            {"B  Clear search", "B  Effacer la recherche"},
+            {"QUEUE", "FILE"}, {"SETUP", "CONFIGURATION"}, {"READY", "PR\u00caT"},
+        }},
+        {"pl", {
+            {"All", "Wszystkie"}, {"Clear search", "Wyczy\u015b\u0107 wyszukiwanie"},
+            {"Search Library", "Przeszukaj bibliotek\u0119"},
+            {"Enter a title to filter your games", "Wpisz tytu\u0142 gry"},
+            {"Search Catalog", "Przeszukaj katalog"},
+            {"Enter a title to filter games", "Wpisz tytu\u0142 gry"},
+            {"Searching for: {0}", "Wyszukiwanie: {0}"},
+            {"B  Clear search", "B  Wyczy\u015b\u0107 wyszukiwanie"},
+            {"QUEUE", "KOLEJKA"}, {"SETUP", "KONFIGURACJA"}, {"READY", "GOTOWE"},
+        }},
+        {"zh-CN", {
+            {"All", "\u5168\u90e8"},
+            {"Clear search", "\u6e05\u9664\u641c\u7d22"},
+            {"Search Library", "\u641c\u7d22\u6e38\u620f\u5e93"},
+            {"Enter a title to filter your games", "\u8f93\u5165\u6e38\u620f\u540d\u79f0"},
+            {"Search Catalog", "\u641c\u7d22\u76ee\u5f55"},
+            {"Enter a title to filter games", "\u8f93\u5165\u6e38\u620f\u540d\u79f0"},
+            {"Searching for: {0}", "\u6b63\u5728\u641c\u7d22\uff1a{0}"},
+            {"B  Clear search", "B  \u6e05\u9664\u641c\u7d22"},
+            {"QUEUE", "\u6392\u961f"}, {"SETUP", "\u8bbe\u7f6e"}, {"READY", "\u5c31\u7eea"},
+        }},
+    };
+    const auto found = dictionaries.find(code);
+    return found == dictionaries.end() ? empty : found->second;
+}
+
+const Dictionary& SessionLaunchDictionaryFor(const std::string& code)
+{
+    static const Dictionary empty;
+    static const std::unordered_map<std::string, Dictionary> dictionaries = {
+        {"ru", {
+            {"Advertisement required", "Требуется реклама"},
+            {"Waiting for NVIDIA to provide the Free-tier advertisement details.", "Ожидание данных рекламы для бесплатного тарифа от NVIDIA."},
+            {"Free-tier advertisement ready", "Реклама для бесплатного тарифа готова"},
+            {" ({0} seconds)", " ({0} с)"},
+            {". Prepared format: {0}", ". Формат: {0}"},
+            {". Playback will begin automatically.", ". Воспроизведение начнется автоматически."},
+            {"Advertisement complete", "Реклама завершена"},
+            {"Returning to cloud rig preparation.", "Возвращение к подготовке облачной системы."},
+            {"NVIDIA is updating this game...\nThe session will start automatically when patching finishes.", "NVIDIA обновляет игру...\nСеанс начнется автоматически после завершения обновления."},
+            {"In queue... Position: {0}", "В очереди... Позиция: {0}"},
+            {"Setting up rig... Position: {0}", "Настройка облачной системы... Позиция: {0}"},
+            {"Setting up rig... Please wait.", "Настройка облачной системы... Подождите."},
+            {"Waiting for NVIDIA session ads or confirmation...", "Ожидание рекламы сеанса или подтверждения NVIDIA..."},
+            {"Waiting... Status: {0}", "Ожидание... Статус: {0}"},
+            {"Updating the game", "Обновление игры"},
+            {"Waiting for an available cloud rig", "Ожидание доступной облачной системы"},
+            {"Your cloud rig will start automatically when it is ready.", "Облачная система запустится автоматически, когда будет готова."},
+            {"NVIDIA is patching this title. Waiting before retry {0} of 2.", "NVIDIA обновляет игру. Ожидание перед повтором {0} из 2."},
+            {"Connecting to the streaming server", "Подключение к серверу трансляции"},
+            {"The rig is ready. Configuring the secure network path.", "Облачная система готова. Настройка защищенного сетевого подключения."},
+            {"Starting the video stream", "Запуск видеопотока"},
+            {"Negotiating WebRTC and waiting for the first clean frame.", "Настройка WebRTC и ожидание первого целого кадра."},
+        }},
+        {"uk", {
+            {"Advertisement required", "Потрібна реклама"},
+            {"Waiting for NVIDIA to provide the Free-tier advertisement details.", "Очікування даних реклами для безкоштовного тарифу від NVIDIA."},
+            {"Free-tier advertisement ready", "Реклама для безкоштовного тарифу готова"},
+            {" ({0} seconds)", " ({0} с)"},
+            {". Prepared format: {0}", ". Формат: {0}"},
+            {". Playback will begin automatically.", ". Відтворення почнеться автоматично."},
+            {"Advertisement complete", "Рекламу завершено"},
+            {"Returning to cloud rig preparation.", "Повернення до підготовки хмарної системи."},
+            {"NVIDIA is updating this game...\nThe session will start automatically when patching finishes.", "NVIDIA оновлює гру...\nСеанс почнеться автоматично після завершення оновлення."},
+            {"In queue... Position: {0}", "У черзі... Позиція: {0}"},
+            {"Setting up rig... Position: {0}", "Налаштування хмарної системи... Позиція: {0}"},
+            {"Setting up rig... Please wait.", "Налаштування хмарної системи... Зачекайте."},
+            {"Waiting for NVIDIA session ads or confirmation...", "Очікування реклами сеансу або підтвердження NVIDIA..."},
+            {"Waiting... Status: {0}", "Очікування... Статус: {0}"},
+            {"Updating the game", "Оновлення гри"},
+            {"Waiting for an available cloud rig", "Очікування доступної хмарної системи"},
+            {"Your cloud rig will start automatically when it is ready.", "Хмарна система запуститься автоматично, коли буде готова."},
+            {"NVIDIA is patching this title. Waiting before retry {0} of 2.", "NVIDIA оновлює гру. Очікування перед повтором {0} із 2."},
+            {"Connecting to the streaming server", "Підключення до сервера трансляції"},
+            {"The rig is ready. Configuring the secure network path.", "Хмарна система готова. Налаштування захищеного мережевого з'єднання."},
+            {"Starting the video stream", "Запуск відеопотоку"},
+            {"Negotiating WebRTC and waiting for the first clean frame.", "Налаштування WebRTC та очікування першого цілого кадру."},
+        }},
+        {"es", {
+            {"Advertisement required", "Se requiere publicidad"},
+            {"Waiting for NVIDIA to provide the Free-tier advertisement details.", "Esperando los datos del anuncio del plan gratuito de NVIDIA."},
+            {"Free-tier advertisement ready", "Anuncio del plan gratuito listo"},
+            {" ({0} seconds)", " ({0} s)"}, {". Prepared format: {0}", ". Formato: {0}"},
+            {". Playback will begin automatically.", ". La reproducción comenzará automáticamente."},
+            {"Advertisement complete", "Anuncio finalizado"}, {"Returning to cloud rig preparation.", "Volviendo a preparar el equipo en la nube."},
+            {"NVIDIA is updating this game...\nThe session will start automatically when patching finishes.", "NVIDIA está actualizando el juego...\nLa sesión comenzará automáticamente al terminar."},
+            {"In queue... Position: {0}", "En cola... Posición: {0}"}, {"Setting up rig... Position: {0}", "Preparando el equipo... Posición: {0}"},
+            {"Setting up rig... Please wait.", "Preparando el equipo... Espera."}, {"Waiting for NVIDIA session ads or confirmation...", "Esperando anuncios o confirmación de NVIDIA..."},
+            {"Waiting... Status: {0}", "Esperando... Estado: {0}"}, {"Updating the game", "Actualizando el juego"},
+            {"Waiting for an available cloud rig", "Esperando un equipo en la nube disponible"}, {"Your cloud rig will start automatically when it is ready.", "El equipo en la nube se iniciará automáticamente cuando esté listo."},
+            {"NVIDIA is patching this title. Waiting before retry {0} of 2.", "NVIDIA está actualizando el juego. Esperando antes del reintento {0} de 2."},
+            {"Connecting to the streaming server", "Conectando al servidor de streaming"}, {"The rig is ready. Configuring the secure network path.", "El equipo está listo. Configurando la conexión segura."},
+            {"Starting the video stream", "Iniciando el vídeo"}, {"Negotiating WebRTC and waiting for the first clean frame.", "Configurando WebRTC y esperando el primer fotograma válido."},
+        }},
+        {"it", {
+            {"Advertisement required", "Pubblicità richiesta"}, {"Waiting for NVIDIA to provide the Free-tier advertisement details.", "In attesa dei dati pubblicitari del piano gratuito da NVIDIA."},
+            {"Free-tier advertisement ready", "Pubblicità del piano gratuito pronta"}, {" ({0} seconds)", " ({0} s)"}, {". Prepared format: {0}", ". Formato: {0}"},
+            {". Playback will begin automatically.", ". La riproduzione inizierà automaticamente."}, {"Advertisement complete", "Pubblicità completata"},
+            {"Returning to cloud rig preparation.", "Ritorno alla preparazione del PC cloud."}, {"NVIDIA is updating this game...\nThe session will start automatically when patching finishes.", "NVIDIA sta aggiornando il gioco...\nLa sessione inizierà automaticamente al termine."},
+            {"In queue... Position: {0}", "In coda... Posizione: {0}"}, {"Setting up rig... Position: {0}", "Preparazione del PC... Posizione: {0}"},
+            {"Setting up rig... Please wait.", "Preparazione del PC... Attendi."}, {"Waiting for NVIDIA session ads or confirmation...", "In attesa di pubblicità o conferma NVIDIA..."},
+            {"Waiting... Status: {0}", "Attesa... Stato: {0}"}, {"Updating the game", "Aggiornamento del gioco"},
+            {"Waiting for an available cloud rig", "In attesa di un PC cloud disponibile"}, {"Your cloud rig will start automatically when it is ready.", "Il PC cloud si avvierà automaticamente quando sarà pronto."},
+            {"NVIDIA is patching this title. Waiting before retry {0} of 2.", "NVIDIA sta aggiornando il gioco. Attesa prima del tentativo {0} di 2."},
+            {"Connecting to the streaming server", "Connessione al server di streaming"}, {"The rig is ready. Configuring the secure network path.", "Il PC è pronto. Configurazione della connessione sicura."},
+            {"Starting the video stream", "Avvio del video"}, {"Negotiating WebRTC and waiting for the first clean frame.", "Configurazione di WebRTC e attesa del primo fotogramma valido."},
+        }},
+        {"fr", {
+            {"Advertisement required", "Publicité requise"}, {"Waiting for NVIDIA to provide the Free-tier advertisement details.", "En attente des données publicitaires de l'offre gratuite de NVIDIA."},
+            {"Free-tier advertisement ready", "Publicité de l'offre gratuite prête"}, {" ({0} seconds)", " ({0} s)"}, {". Prepared format: {0}", ". Format : {0}"},
+            {". Playback will begin automatically.", ". La lecture commencera automatiquement."}, {"Advertisement complete", "Publicité terminée"},
+            {"Returning to cloud rig preparation.", "Retour à la préparation de la machine cloud."}, {"NVIDIA is updating this game...\nThe session will start automatically when patching finishes.", "NVIDIA met le jeu à jour...\nLa session démarrera automatiquement à la fin."},
+            {"In queue... Position: {0}", "Dans la file... Position : {0}"}, {"Setting up rig... Position: {0}", "Préparation de la machine... Position : {0}"},
+            {"Setting up rig... Please wait.", "Préparation de la machine... Patientez."}, {"Waiting for NVIDIA session ads or confirmation...", "En attente des publicités ou de la confirmation NVIDIA..."},
+            {"Waiting... Status: {0}", "En attente... État : {0}"}, {"Updating the game", "Mise à jour du jeu"},
+            {"Waiting for an available cloud rig", "En attente d'une machine cloud disponible"}, {"Your cloud rig will start automatically when it is ready.", "La machine cloud démarrera automatiquement lorsqu'elle sera prête."},
+            {"NVIDIA is patching this title. Waiting before retry {0} of 2.", "NVIDIA met le jeu à jour. Attente avant la tentative {0} sur 2."},
+            {"Connecting to the streaming server", "Connexion au serveur de streaming"}, {"The rig is ready. Configuring the secure network path.", "La machine est prête. Configuration de la connexion sécurisée."},
+            {"Starting the video stream", "Démarrage de la vidéo"}, {"Negotiating WebRTC and waiting for the first clean frame.", "Configuration de WebRTC et attente de la première image valide."},
+        }},
+        {"pl", {
+            {"Advertisement required", "Wymagana reklama"}, {"Waiting for NVIDIA to provide the Free-tier advertisement details.", "Oczekiwanie na dane reklamy bezpłatnego planu od NVIDIA."},
+            {"Free-tier advertisement ready", "Reklama bezpłatnego planu jest gotowa"}, {" ({0} seconds)", " ({0} s)"}, {". Prepared format: {0}", ". Format: {0}"},
+            {". Playback will begin automatically.", ". Odtwarzanie rozpocznie się automatycznie."}, {"Advertisement complete", "Reklama zakończona"},
+            {"Returning to cloud rig preparation.", "Powrót do przygotowania komputera w chmurze."}, {"NVIDIA is updating this game...\nThe session will start automatically when patching finishes.", "NVIDIA aktualizuje grę...\nSesja rozpocznie się automatycznie po zakończeniu."},
+            {"In queue... Position: {0}", "W kolejce... Pozycja: {0}"}, {"Setting up rig... Position: {0}", "Przygotowywanie komputera... Pozycja: {0}"},
+            {"Setting up rig... Please wait.", "Przygotowywanie komputera... Zaczekaj."}, {"Waiting for NVIDIA session ads or confirmation...", "Oczekiwanie na reklamy sesji lub potwierdzenie NVIDIA..."},
+            {"Waiting... Status: {0}", "Oczekiwanie... Stan: {0}"}, {"Updating the game", "Aktualizowanie gry"},
+            {"Waiting for an available cloud rig", "Oczekiwanie na dostępny komputer w chmurze"}, {"Your cloud rig will start automatically when it is ready.", "Komputer w chmurze uruchomi się automatycznie, gdy będzie gotowy."},
+            {"NVIDIA is patching this title. Waiting before retry {0} of 2.", "NVIDIA aktualizuje grę. Oczekiwanie przed próbą {0} z 2."},
+            {"Connecting to the streaming server", "Łączenie z serwerem transmisji"}, {"The rig is ready. Configuring the secure network path.", "Komputer jest gotowy. Konfigurowanie bezpiecznego połączenia."},
+            {"Starting the video stream", "Uruchamianie obrazu"}, {"Negotiating WebRTC and waiting for the first clean frame.", "Konfigurowanie WebRTC i oczekiwanie na pierwszą poprawną klatkę."},
+        }},
+        {"zh-CN", {
+            {"Advertisement required", "需要观看广告"}, {"Waiting for NVIDIA to provide the Free-tier advertisement details.", "正在等待 NVIDIA 提供免费方案广告信息。"},
+            {"Free-tier advertisement ready", "免费方案广告已准备就绪"}, {" ({0} seconds)", "（{0} 秒）"}, {". Prepared format: {0}", "。格式：{0}"},
+            {". Playback will begin automatically.", "。即将自动播放。"}, {"Advertisement complete", "广告播放完毕"},
+            {"Returning to cloud rig preparation.", "返回云端设备准备流程。"}, {"NVIDIA is updating this game...\nThe session will start automatically when patching finishes.", "NVIDIA 正在更新游戏...\n更新完成后会自动开始会话。"},
+            {"In queue... Position: {0}", "正在排队... 位置：{0}"}, {"Setting up rig... Position: {0}", "正在设置云端设备... 位置：{0}"},
+            {"Setting up rig... Please wait.", "正在设置云端设备... 请稍候。"}, {"Waiting for NVIDIA session ads or confirmation...", "正在等待 NVIDIA 会话广告或确认..."},
+            {"Waiting... Status: {0}", "正在等待... 状态：{0}"}, {"Updating the game", "正在更新游戏"},
+            {"Waiting for an available cloud rig", "正在等待可用的云端设备"}, {"Your cloud rig will start automatically when it is ready.", "云端设备准备就绪后将自动启动。"},
+            {"NVIDIA is patching this title. Waiting before retry {0} of 2.", "NVIDIA 正在更新游戏。等待后进行第 {0}/2 次尝试。"},
+            {"Connecting to the streaming server", "正在连接串流服务器"}, {"The rig is ready. Configuring the secure network path.", "云端设备已就绪。正在配置安全网络连接。"},
+            {"Starting the video stream", "正在启动视频串流"}, {"Negotiating WebRTC and waiting for the first clean frame.", "正在配置 WebRTC 并等待第一个完整画面。"},
+        }},
+    };
+    const auto found = dictionaries.find(code);
+    return found == dictionaries.end() ? empty : found->second;
+}
+
+const Dictionary& UpdateDictionaryFor(const std::string& code)
+{
+    static const Dictionary empty;
+    static const std::unordered_map<std::string, Dictionary> dictionaries = {
+        {"ru", {
+            {"Updates", "Обновления"}, {"Updates are checked only when you choose this action.", "Проверка обновлений выполняется только вручную."},
+            {"Installed version", "Установленная версия"}, {"Check for updates", "Проверить обновления"}, {"Check", "Проверить"},
+            {"Check the official SwitchNOW GitHub release and install a newer NRO safely.", "Проверить официальный релиз SwitchNOW на GitHub и безопасно установить новую версию."},
+            {"Checking for updates...", "Проверка обновлений..."}, {"Update check failed", "Не удалось проверить обновления"},
+            {"SwitchNOW is up to date", "SwitchNOW уже обновлён"}, {"You already have the latest version ({0}).", "У вас уже установлена актуальная версия ({0})."},
+            {"Update available", "Доступно обновление"}, {"Version {0} is available. Installed version: {1}.", "Доступна версия {0}. Установлена версия: {1}."},
+            {"Download and install it now?", "Скачать и установить её сейчас?"}, {"Install", "Установить"}, {"Downloading update...", "Загрузка обновления..."},
+            {"Update installation failed", "Не удалось установить обновление"}, {"Update ready", "Обновление готово"},
+            {"Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.", "Версия {0} загружена и проверена. Во время установки SwitchNOW вернётся в меню HOME."},
+            {"Install update", "Установить обновление"}, {"Later", "Позже"}, {"HOME shortcut created", "Ярлык HOME создан"},
+            {"The shortcut for {0} was created successfully and added to the HOME Menu.", "Ярлык для {0} успешно создан и добавлен в меню HOME."},
+            {"HOME shortcut installation failed", "Не удалось установить ярлык HOME"}
+        }},
+        {"uk", {
+            {"Updates", "Оновлення"}, {"Updates are checked only when you choose this action.", "Перевірка оновлень виконується лише вручну."},
+            {"Installed version", "Встановлена версія"}, {"Check for updates", "Перевірити оновлення"}, {"Check", "Перевірити"},
+            {"Check the official SwitchNOW GitHub release and install a newer NRO safely.", "Перевірити офіційний реліз SwitchNOW на GitHub і безпечно встановити нову версію."},
+            {"Checking for updates...", "Перевірка оновлень..."}, {"Update check failed", "Не вдалося перевірити оновлення"},
+            {"SwitchNOW is up to date", "SwitchNOW уже оновлено"}, {"You already have the latest version ({0}).", "У вас уже встановлена актуальна версія ({0})."},
+            {"Update available", "Доступне оновлення"}, {"Version {0} is available. Installed version: {1}.", "Доступна версія {0}. Встановлена версія: {1}."},
+            {"Download and install it now?", "Завантажити та встановити її зараз?"}, {"Install", "Встановити"}, {"Downloading update...", "Завантаження оновлення..."},
+            {"Update installation failed", "Не вдалося встановити оновлення"}, {"Update ready", "Оновлення готове"},
+            {"Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.", "Версію {0} завантажено й перевірено. Під час встановлення SwitchNOW повернеться до меню HOME."},
+            {"Install update", "Встановити оновлення"}, {"Later", "Пізніше"}, {"HOME shortcut created", "Ярлик HOME створено"},
+            {"The shortcut for {0} was created successfully and added to the HOME Menu.", "Ярлик для {0} успішно створено й додано до меню HOME."},
+            {"HOME shortcut installation failed", "Не вдалося встановити ярлик HOME"}
+        }},
+        {"es", {
+            {"Updates", "Actualizaciones"}, {"Updates are checked only when you choose this action.", "Las actualizaciones se comprueban solo de forma manual."},
+            {"Installed version", "Versión instalada"}, {"Check for updates", "Buscar actualizaciones"}, {"Check", "Comprobar"},
+            {"Check the official SwitchNOW GitHub release and install a newer NRO safely.", "Comprueba la versión oficial de SwitchNOW en GitHub e instala un NRO nuevo de forma segura."},
+            {"Checking for updates...", "Buscando actualizaciones..."}, {"Update check failed", "No se pudo buscar actualizaciones"},
+            {"SwitchNOW is up to date", "SwitchNOW está actualizado"}, {"You already have the latest version ({0}).", "Ya tienes la versión más reciente ({0})."},
+            {"Update available", "Actualización disponible"}, {"Version {0} is available. Installed version: {1}.", "La versión {0} está disponible. Versión instalada: {1}."},
+            {"Download and install it now?", "¿Descargarla e instalarla ahora?"}, {"Install", "Instalar"}, {"Downloading update...", "Descargando actualización..."},
+            {"Update installation failed", "No se pudo instalar la actualización"}, {"Update ready", "Actualización lista"},
+            {"Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.", "La versión {0} se descargó y verificó. SwitchNOW volverá al menú HOME durante la instalación."},
+            {"Install update", "Instalar actualización"}, {"Later", "Más tarde"}, {"HOME shortcut created", "Acceso directo HOME creado"},
+            {"The shortcut for {0} was created successfully and added to the HOME Menu.", "El acceso directo de {0} se creó correctamente y se añadió al menú HOME."},
+            {"HOME shortcut installation failed", "No se pudo instalar el acceso directo HOME"}
+        }},
+        {"it", {
+            {"Updates", "Aggiornamenti"}, {"Updates are checked only when you choose this action.", "Gli aggiornamenti vengono controllati solo manualmente."},
+            {"Installed version", "Versione installata"}, {"Check for updates", "Controlla aggiornamenti"}, {"Check", "Controlla"},
+            {"Check the official SwitchNOW GitHub release and install a newer NRO safely.", "Controlla la release ufficiale di SwitchNOW su GitHub e installa in sicurezza un NRO più recente."},
+            {"Checking for updates...", "Controllo aggiornamenti..."}, {"Update check failed", "Controllo aggiornamenti non riuscito"},
+            {"SwitchNOW is up to date", "SwitchNOW è aggiornato"}, {"You already have the latest version ({0}).", "Hai già la versione più recente ({0})."},
+            {"Update available", "Aggiornamento disponibile"}, {"Version {0} is available. Installed version: {1}.", "È disponibile la versione {0}. Versione installata: {1}."},
+            {"Download and install it now?", "Scaricarla e installarla ora?"}, {"Install", "Installa"}, {"Downloading update...", "Download aggiornamento..."},
+            {"Update installation failed", "Installazione aggiornamento non riuscita"}, {"Update ready", "Aggiornamento pronto"},
+            {"Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.", "La versione {0} è stata scaricata e verificata. SwitchNOW tornerà al menu HOME durante l'installazione."},
+            {"Install update", "Installa aggiornamento"}, {"Later", "Più tardi"}, {"HOME shortcut created", "Collegamento HOME creato"},
+            {"The shortcut for {0} was created successfully and added to the HOME Menu.", "Il collegamento per {0} è stato creato e aggiunto al menu HOME."},
+            {"HOME shortcut installation failed", "Installazione del collegamento HOME non riuscita"}
+        }},
+        {"fr", {
+            {"Updates", "Mises à jour"}, {"Updates are checked only when you choose this action.", "Les mises à jour sont vérifiées uniquement manuellement."},
+            {"Installed version", "Version installée"}, {"Check for updates", "Rechercher des mises à jour"}, {"Check", "Vérifier"},
+            {"Check the official SwitchNOW GitHub release and install a newer NRO safely.", "Vérifiez la version officielle de SwitchNOW sur GitHub et installez un NRO plus récent en toute sécurité."},
+            {"Checking for updates...", "Recherche de mises à jour..."}, {"Update check failed", "Échec de la recherche de mises à jour"},
+            {"SwitchNOW is up to date", "SwitchNOW est à jour"}, {"You already have the latest version ({0}).", "Vous avez déjà la dernière version ({0})."},
+            {"Update available", "Mise à jour disponible"}, {"Version {0} is available. Installed version: {1}.", "La version {0} est disponible. Version installée : {1}."},
+            {"Download and install it now?", "La télécharger et l'installer maintenant ?"}, {"Install", "Installer"}, {"Downloading update...", "Téléchargement de la mise à jour..."},
+            {"Update installation failed", "Échec de l'installation de la mise à jour"}, {"Update ready", "Mise à jour prête"},
+            {"Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.", "La version {0} a été téléchargée et vérifiée. SwitchNOW reviendra au menu HOME pendant l'installation."},
+            {"Install update", "Installer la mise à jour"}, {"Later", "Plus tard"}, {"HOME shortcut created", "Raccourci HOME créé"},
+            {"The shortcut for {0} was created successfully and added to the HOME Menu.", "Le raccourci de {0} a été créé et ajouté au menu HOME."},
+            {"HOME shortcut installation failed", "Échec de l'installation du raccourci HOME"}
+        }},
+        {"pl", {
+            {"Updates", "Aktualizacje"}, {"Updates are checked only when you choose this action.", "Aktualizacje są sprawdzane tylko ręcznie."},
+            {"Installed version", "Zainstalowana wersja"}, {"Check for updates", "Sprawdź aktualizacje"}, {"Check", "Sprawdź"},
+            {"Check the official SwitchNOW GitHub release and install a newer NRO safely.", "Sprawdź oficjalne wydanie SwitchNOW na GitHub i bezpiecznie zainstaluj nowszy plik NRO."},
+            {"Checking for updates...", "Sprawdzanie aktualizacji..."}, {"Update check failed", "Nie udało się sprawdzić aktualizacji"},
+            {"SwitchNOW is up to date", "SwitchNOW jest aktualny"}, {"You already have the latest version ({0}).", "Masz już najnowszą wersję ({0})."},
+            {"Update available", "Dostępna aktualizacja"}, {"Version {0} is available. Installed version: {1}.", "Dostępna jest wersja {0}. Zainstalowana wersja: {1}."},
+            {"Download and install it now?", "Pobrać i zainstalować ją teraz?"}, {"Install", "Zainstaluj"}, {"Downloading update...", "Pobieranie aktualizacji..."},
+            {"Update installation failed", "Nie udało się zainstalować aktualizacji"}, {"Update ready", "Aktualizacja gotowa"},
+            {"Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.", "Wersja {0} została pobrana i zweryfikowana. Podczas instalacji SwitchNOW wróci do menu HOME."},
+            {"Install update", "Zainstaluj aktualizację"}, {"Later", "Później"}, {"HOME shortcut created", "Utworzono skrót HOME"},
+            {"The shortcut for {0} was created successfully and added to the HOME Menu.", "Skrót dla {0} został utworzony i dodany do menu HOME."},
+            {"HOME shortcut installation failed", "Nie udało się zainstalować skrótu HOME"}
+        }},
+        {"zh-CN", {
+            {"Updates", "更新"}, {"Updates are checked only when you choose this action.", "仅在手动选择此操作时检查更新。"},
+            {"Installed version", "已安装版本"}, {"Check for updates", "检查更新"}, {"Check", "检查"},
+            {"Check the official SwitchNOW GitHub release and install a newer NRO safely.", "检查 GitHub 上的 SwitchNOW 官方版本并安全安装较新的 NRO。"},
+            {"Checking for updates...", "正在检查更新..."}, {"Update check failed", "检查更新失败"},
+            {"SwitchNOW is up to date", "SwitchNOW 已是最新版本"}, {"You already have the latest version ({0}).", "你已安装最新版本（{0}）。"},
+            {"Update available", "有可用更新"}, {"Version {0} is available. Installed version: {1}.", "版本 {0} 可用。已安装版本：{1}。"},
+            {"Download and install it now?", "现在下载并安装吗？"}, {"Install", "安装"}, {"Downloading update...", "正在下载更新..."},
+            {"Update installation failed", "更新安装失败"}, {"Update ready", "更新已准备好"},
+            {"Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.", "版本 {0} 已下载并验证。安装更新时 SwitchNOW 将返回 HOME 菜单。"},
+            {"Install update", "安装更新"}, {"Later", "稍后"}, {"HOME shortcut created", "HOME 快捷方式已创建"},
+            {"The shortcut for {0} was created successfully and added to the HOME Menu.", "{0} 的快捷方式已成功创建并添加到 HOME 菜单。"},
+            {"HOME shortcut installation failed", "HOME 快捷方式安装失败"}
+        }}
+    };
+    const auto found = dictionaries.find(code);
+    return found == dictionaries.end() ? empty : found->second;
+}
+
 } // namespace
 
 const std::vector<InterfaceLanguageOption>& InterfaceLanguageOptions()
@@ -633,9 +951,21 @@ std::string Tr(const std::string& english)
     const auto completion_found = completion_dictionary.find(english);
     if (completion_found != completion_dictionary.end())
         return completion_found->second;
+    const auto& search_launch_dictionary = SearchAndLaunchDictionaryFor(g_language);
+    const auto search_launch_found = search_launch_dictionary.find(english);
+    if (search_launch_found != search_launch_dictionary.end())
+        return search_launch_found->second;
+    const auto& session_launch_dictionary = SessionLaunchDictionaryFor(g_language);
+    const auto session_launch_found = session_launch_dictionary.find(english);
+    if (session_launch_found != session_launch_dictionary.end())
+        return session_launch_found->second;
     const auto& server_dictionary = ServerDictionaryFor(g_language);
     const auto server_found = server_dictionary.find(english);
-    return server_found == server_dictionary.end() ? english : server_found->second;
+    if (server_found != server_dictionary.end())
+        return server_found->second;
+    const auto& update_dictionary = UpdateDictionaryFor(g_language);
+    const auto update_found = update_dictionary.find(english);
+    return update_found == update_dictionary.end() ? english : update_found->second;
 }
 
 std::string Tr(const char* english)

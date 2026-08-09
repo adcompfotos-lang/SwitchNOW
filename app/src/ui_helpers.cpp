@@ -106,7 +106,8 @@ class LaunchAnimationView final : public brls::View
             nvgText(vg, cx, rail_y, number.c_str(), nullptr);
             nvgFontSize(vg, 12.0f);
             nvgFillColor(vg, complete || active ? nvgRGB(228, 235, 232) : nvgRGB(91, 96, 105));
-            nvgText(vg, cx, rail_y + 42.0f, kLabels[i], nullptr);
+            const std::string stage_label = Tr(kLabels[i]);
+            nvgText(vg, cx, rail_y + 42.0f, stage_label.c_str(), nullptr);
         }
 
         const float spinner_x = x + width * 0.5f;
@@ -177,23 +178,25 @@ void SetLaunchProgress(
 std::string SessionStatusText(const SessionInfo& info)
 {
     if (info.app_patching)
-        return "NVIDIA is updating this game...\nThe session will start automatically when patching finishes.";
+        return Tr("NVIDIA is updating this game...\nThe session will start automatically when patching finishes.");
 
     if (info.status == 0)
-        return "In queue... Position: " + std::to_string(info.queue_position);
+        return TrFormat("In queue... Position: {0}",
+                        {std::to_string(info.queue_position)});
 
     if (info.status == 1)
     {
         if (info.queue_position > 0)
-            return "Setting up rig... Position: " + std::to_string(info.queue_position);
+            return TrFormat("Setting up rig... Position: {0}",
+                            {std::to_string(info.queue_position)});
 
-        return "Setting up rig... Please wait.";
+        return Tr("Setting up rig... Please wait.");
     }
 
     if (info.status == 6)
-        return "Waiting for NVIDIA session ads or confirmation...";
+        return Tr("Waiting for NVIDIA session ads or confirmation...");
 
-    return "Waiting... Status: " + std::to_string(info.status);
+    return TrFormat("Waiting... Status: {0}", {std::to_string(info.status)});
 }
 
 } // namespace
@@ -203,6 +206,14 @@ void ShowDialog(const std::string& title, const std::string& body)
     auto* dialog = new brls::Dialog(Tr(title) + "\n\n" + Tr(body));
     dialog->addButton(Tr("Close"), [] {});
     dialog->setCancelable(true);
+    dialog->open();
+}
+
+void ShowModalDialog(const std::string& title, const std::string& body)
+{
+    auto* dialog = new brls::Dialog(Tr(title) + "\n\n" + Tr(body));
+    dialog->addButton(Tr("Close"), [] {});
+    dialog->setCancelable(false);
     dialog->open();
 }
 
@@ -388,6 +399,85 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
             bool ad_break_logged = false;
             std::unordered_set<std::string> completed_ads;
             HttpClient ad_http_client;
+
+            auto apply_ad_report_response = [&info](SessionInfo updated) {
+                // Ad-update replies focus on queue/ad state and may omit the
+                // connection data returned by StartSession. Keep that data so
+                // the next report and the eventual stream use the same node.
+                if (updated.session_id.empty())
+                    updated.session_id = info.session_id;
+                if (updated.server_ip.empty())
+                    updated.server_ip = info.server_ip;
+                if (updated.signaling_url.empty())
+                    updated.signaling_url = info.signaling_url;
+                if (updated.media_ip.empty())
+                    updated.media_ip = info.media_ip;
+                if (updated.media_port == 0)
+                    updated.media_port = info.media_port;
+                if (updated.ice_servers.empty())
+                    updated.ice_servers = info.ice_servers;
+                if (updated.session_token.empty())
+                    updated.session_token = info.session_token;
+                if (updated.requested_region_url.empty())
+                    updated.requested_region_url = info.requested_region_url;
+                if (updated.assigned_server_id.empty())
+                    updated.assigned_server_id = info.assigned_server_id;
+                info = std::move(updated);
+            };
+
+            auto report_ad = [&](const SessionAdReport& report,
+                                 const char* phase,
+                                 int maximum_attempts) -> bool {
+                std::string last_error;
+                for (int attempt = 1; attempt <= maximum_attempts; ++attempt)
+                {
+                    if (!launch_state->running)
+                        return false;
+                    try
+                    {
+                        const std::string assigned_server = info.server_ip;
+                        SessionInfo updated = bg_client.ReportSessionAd(
+                            bg_auth, info.session_id, report, assigned_server);
+                        apply_ad_report_response(std::move(updated));
+                        LogRuntimeEvent(
+                            "session", "ad_report_accepted",
+                            "phase=" + std::string(phase) +
+                                " attempt=" + std::to_string(attempt) +
+                                " ad_id=" + report.ad_id +
+                                " server=" +
+                                (assigned_server.empty()
+                                     ? std::string("region")
+                                     : assigned_server));
+                        return true;
+                    }
+                    catch (const std::exception& e)
+                    {
+                        last_error = e.what();
+                        const bool recoverable =
+                            ad_report::IsRecoverableTransitionError(last_error);
+                        LogRuntimeEvent(
+                            "session", "ad_report_rejected",
+                            "phase=" + std::string(phase) +
+                                " attempt=" + std::to_string(attempt) +
+                                " recoverable=" +
+                                std::to_string(recoverable ? 1 : 0) +
+                                " ad_id=" + report.ad_id +
+                                " error=" + last_error);
+                        if (!recoverable)
+                            throw;
+                        if (attempt < maximum_attempts)
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(250 * attempt));
+                    }
+                }
+
+                LogRuntimeEvent(
+                    "session", "ad_report_deferred",
+                    "phase=" + std::string(phase) +
+                        " ad_id=" + report.ad_id +
+                        " error=" + last_error);
+                return false;
+            };
             
             while (info.status != 2 && info.status != 3) {
                 if (info.status > 3 && info.status != 6) {
@@ -406,13 +496,15 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                 {
                     const int duration = ad_break::TotalDurationSeconds(info.ad_break);
                     const auto* media = ad_break::SelectPreferredMedia(info.ad_break);
-                    queue_title = "Advertisement required";
-                    queue_detail = "Free-tier advertisement ready";
+                    queue_title = Tr("Advertisement required");
+                    queue_detail = Tr("Free-tier advertisement ready");
                     if (duration > 0)
-                        queue_detail += " (" + std::to_string(duration) + " seconds)";
+                        queue_detail += TrFormat(" ({0} seconds)",
+                                                 {std::to_string(duration)});
                     if (media && !media->encoding_profile.empty())
-                        queue_detail += ". Prepared format: " + media->encoding_profile;
-                    queue_detail += ". Playback will begin automatically.";
+                        queue_detail += TrFormat(". Prepared format: {0}",
+                                                 {media->encoding_profile});
+                    queue_detail += Tr(". Playback will begin automatically.");
 
                     if (!ad_break_logged)
                     {
@@ -458,10 +550,8 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                             ad_playback_state,
                             [launch_state]() { return !launch_state->running.load(); },
                             [&]() {
-                                info = bg_client.ReportSessionAd(
-                                    bg_auth, info.session_id,
-                                    ad_report::Started(ad.id));
-                                start_reported = true;
+                                start_reported = report_ad(
+                                    ad_report::Started(ad.id), "start", 3);
                             });
 
                         if (!playback.completed)
@@ -476,7 +566,8 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                                             ad.id, playback.watched_time_ms,
                                             playback.cancelled
                                                 ? "user_cancelled"
-                                                : "playback_error"));
+                                                : "playback_error"),
+                                        info.server_ip);
                                 }
                                 catch (...) {}
                             }
@@ -489,11 +580,30 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                                     : playback.error);
                         }
 
-                        info = bg_client.ReportSessionAd(
-                            bg_auth, info.session_id,
-                            ad_report::Finished(
-                                ad.id, playback.watched_time_ms,
-                                std::max(0, ad.duration_seconds) * 1000));
+                        // A Start update can race the first queue transition.
+                        // Retry it after playback, when the ad opportunity is
+                        // definitely active, before sending Finish.
+                        if (!start_reported)
+                        {
+                            start_reported = report_ad(
+                                ad_report::Started(ad.id),
+                                "start_after_playback", 3);
+                        }
+
+                        bool finish_reported = false;
+                        if (start_reported)
+                        {
+                            finish_reported = report_ad(
+                                ad_report::Finished(
+                                    ad.id, playback.watched_time_ms,
+                                    std::max(0, ad.duration_seconds) * 1000),
+                                "finish", 3);
+                        }
+
+                        // Desktop OpenNOW treats rejected ad transitions as
+                        // non-fatal and resumes polling. Do the same instead of
+                        // deleting a valid cloud session after the user has
+                        // already watched the advertisement.
                         completed_ads.insert(ad.id);
                         ++ads_played_this_break;
                         played_ad = true;
@@ -504,7 +614,11 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                             " completed=" +
                             std::to_string(completed_ads.size()) +
                             " server_ads=" +
-                            std::to_string(info.ad_break.ads.size()));
+                            std::to_string(info.ad_break.ads.size()) +
+                            " start_reported=" +
+                            std::to_string(start_reported ? 1 : 0) +
+                            " finish_reported=" +
+                            std::to_string(finish_reported ? 1 : 0));
                     }
                     if (ads_played_this_break == kMaximumAdsPerBreak)
                         throw std::runtime_error(
@@ -517,8 +631,8 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                 }
                 else if (ad_state == ad_break::PresentationState::AwaitingMetadata)
                 {
-                    queue_title = "Advertisement required";
-                    queue_detail = "Waiting for NVIDIA to provide the Free-tier advertisement details.";
+                    queue_title = Tr("Advertisement required");
+                    queue_detail = Tr("Waiting for NVIDIA to provide the Free-tier advertisement details.");
                 }
                 else if (info.queue_position > 0)
                 {
@@ -591,8 +705,9 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     post_progress(
                         1,
                         "Updating the game",
-                        "NVIDIA is patching this title. Waiting before retry " +
-                            std::to_string(app_patching_retries) + " of 2.",
+                        TrFormat(
+                            "NVIDIA is patching this title. Waiting before retry {0} of 2.",
+                            {std::to_string(app_patching_retries)}),
                         0.42f);
 
                     for (int wait_step = 0; wait_step < 60; ++wait_step)

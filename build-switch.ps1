@@ -15,3 +15,6 @@ if ($repo -match "^([A-Za-z]):/(.*)$") {
 }
 
 & $bash -lc "cd '$repo' && bash scripts/build-switch-msys2.sh"
+if ($LASTEXITCODE -ne 0) {
+    throw "Nintendo Switch build failed with exit code $LASTEXITCODE."
+}

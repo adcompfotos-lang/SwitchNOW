@@ -129,6 +129,43 @@ std::string SelectBestMeasuredRegionUrl(const RegionRange& regions)
     return best_url;
 }
 
+template <typename RegionRange>
+std::vector<size_t> SelectLatencyFinalists(
+    const RegionRange& regions,
+    size_t maximum_finalists,
+    int margin_ms)
+{
+    std::vector<size_t> ranked;
+    ranked.reserve(regions.size());
+    for (size_t index = 0; index < regions.size(); ++index)
+    {
+        if (regions[index].ping_ms >= 0 &&
+            !NormalizeStreamingBaseUrl(regions[index].url).empty())
+        {
+            ranked.push_back(index);
+        }
+    }
+
+    std::stable_sort(
+        ranked.begin(), ranked.end(), [&regions](size_t left, size_t right) {
+            if (regions[left].ping_ms != regions[right].ping_ms)
+                return regions[left].ping_ms < regions[right].ping_ms;
+            return regions[left].name < regions[right].name;
+        });
+    if (ranked.empty() || maximum_finalists == 0)
+        return {};
+
+    const int cutoff = regions[ranked.front()].ping_ms + std::max(0, margin_ms);
+    const auto end = std::find_if(
+        ranked.begin(), ranked.end(), [&regions, cutoff](size_t index) {
+            return regions[index].ping_ms > cutoff;
+        });
+    ranked.erase(end, ranked.end());
+    if (ranked.size() > maximum_finalists)
+        ranked.resize(maximum_finalists);
+    return ranked;
+}
+
 inline std::string ResolveStreamingBaseUrl(
     const std::string& selected_region,
     const std::string& provider_url,

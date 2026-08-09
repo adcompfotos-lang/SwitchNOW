@@ -40,6 +40,7 @@ class SettingsTab : public brls::Box
     void RefreshSummary();
     void SelectCategory(Category category);
     void RebuildCategory();
+    void ScheduleCategoryRebuild();
     void BuildAccountPage();
     void BuildStreamPage();
     void BuildGamePage();
@@ -73,7 +74,10 @@ class SettingsTab : public brls::Box
         const std::string& button_text,
         std::function<bool(brls::View*)> action,
         bool destructive = false);
-    void AddInfoLine(brls::Box* parent, const std::string& label, const std::string& value);
+    brls::Label* AddInfoLine(
+        brls::Box* parent,
+        const std::string& label,
+        const std::string& value);
 
     bool ShowSessionDialog(brls::View* view);
     bool TestTokenRefresh(brls::View* view);
@@ -95,6 +99,7 @@ class SettingsTab : public brls::Box
     bool ToggleDebugDiagnostics(brls::View* view);
     bool ShowDiagnostics(brls::View* view);
     bool ChooseInterfaceLanguage(brls::View* view);
+    bool CheckForUpdates(brls::View* view);
 
     GfnClient client_;
     brls::Label* page_title_ = nullptr;
@@ -109,6 +114,7 @@ class SettingsTab : public brls::Box
     StreamSettings draft_settings_;
     bool settings_loaded_ = false;
     bool dirty_ = false;
+    bool rebuild_scheduled_ = false;
     std::vector<StreamRegion> server_locations_;
     bool server_locations_loaded_ = false;
     bool server_locations_loading_ = false;

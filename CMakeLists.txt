@@ -123,13 +123,58 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 set(PROJECT_AUTHOR "OpenCloudGaming")
-set(PROJECT_VERSION_STRING "1.1.7")
+set(PROJECT_VERSION_STRING "1.2.0")
 set(PROJECT_TITLEID "05004F4E4F575358")
 set(PROJECT_ICON ${CMAKE_CURRENT_SOURCE_DIR}/resources/icon/icon.jpg)
 set(PROJECT_ROMFS_DIR ${CMAKE_BINARY_DIR}/romfs)
 
+add_executable(SwitchNOWShortcut app/shortcut/main.c)
+target_compile_options(SwitchNOWShortcut PRIVATE -Wall -Wextra -Werror)
+
+add_custom_target(SwitchNOWShortcut.nro
+    DEPENDS SwitchNOWShortcut
+    COMMAND ${NX_NACPTOOL_EXE}
+        --create
+        "SwitchNOW Game Shortcut"
+        "SwitchNOW"
+        "SwitchNOW"
+        SwitchNOWShortcut.nacp
+        --titleid=05004F4E53484F52
+    COMMAND ${NX_ELF2NRO_EXE}
+        SwitchNOWShortcut.elf
+        SwitchNOWShortcut.nro
+        --icon=${PROJECT_ICON}
+        --nacp=SwitchNOWShortcut.nacp
+)
+
+add_executable(SwitchNOWUpdater app/updater/main.c)
+target_include_directories(SwitchNOWUpdater PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern/libpeer/third_party/mbedtls/include
+)
+target_link_directories(SwitchNOWUpdater BEFORE PRIVATE
+    ${CMAKE_BINARY_DIR}/dist/lib
+)
+target_link_libraries(SwitchNOWUpdater PRIVATE mbedcrypto)
+target_compile_options(SwitchNOWUpdater PRIVATE -Wall -Wextra -Werror)
+
+add_custom_target(SwitchNOWUpdater.nro
+    DEPENDS SwitchNOWUpdater
+    COMMAND ${NX_NACPTOOL_EXE}
+        --create
+        "SwitchNOW Update Helper"
+        "SwitchNOW"
+        "${PROJECT_VERSION_STRING}"
+        SwitchNOWUpdater.nacp
+        --titleid=05004F4E55504454
+    COMMAND ${NX_ELF2NRO_EXE}
+        SwitchNOWUpdater.elf
+        SwitchNOWUpdater.nro
+        --icon=${PROJECT_ICON}
+        --nacp=SwitchNOWUpdater.nacp
+)
+
 add_custom_target(${PROJECT_NAME}.nro
-    DEPENDS ${PROJECT_NAME}
+    DEPENDS ${PROJECT_NAME} SwitchNOWShortcut.nro SwitchNOWUpdater.nro
     COMMAND ${NX_NACPTOOL_EXE}
         --create
         "SwitchNOW"
@@ -139,6 +184,8 @@ add_custom_target(${PROJECT_NAME}.nro
         --titleid=${PROJECT_TITLEID}
     COMMAND ${CMAKE_COMMAND} -E remove_directory ${PROJECT_ROMFS_DIR}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${PROJECT_ROMFS_DIR}/img
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PROJECT_ROMFS_DIR}/shortcut
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PROJECT_ROMFS_DIR}/updater
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/resources/font
         ${PROJECT_ROMFS_DIR}/font
@@ -157,6 +204,15 @@ add_custom_target(${PROJECT_NAME}.nro
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_BINARY_DIR}/resources/shaders
         ${PROJECT_ROMFS_DIR}/shaders
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_BINARY_DIR}/SwitchNOWShortcut.nro
+        ${PROJECT_ROMFS_DIR}/shortcut/SwitchNOWShortcut.nro
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/switchnow-forwarder-installer/switchnow-forwarder-installer.nro
+        ${PROJECT_ROMFS_DIR}/shortcut/SwitchNOWForwarderInstaller.nro
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_BINARY_DIR}/SwitchNOWUpdater.nro
+        ${PROJECT_ROMFS_DIR}/updater/SwitchNOWUpdater.nro
     COMMAND ${NX_ELF2NRO_EXE}
         ${PROJECT_NAME}.elf
         ${PROJECT_NAME}.nro

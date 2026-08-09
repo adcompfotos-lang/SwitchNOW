@@ -41,11 +41,13 @@ class GameDetailView : public brls::Box
 {
   public:
     GameDetailView(const GfnClient& client, GameDetailData data);
+    ~GameDetailView() override;
 
   private:
     void Play();
     void ShowStoreSelector(bool launch_after_selection);
     void LaunchSelectedVariant();
+    void CreateSwitchShortcut();
     void UpdateStoreButton();
     void OpenNteCredentialsMenu();
     void ConfigureNteCredentials();
@@ -64,6 +66,8 @@ class GameDetailView : public brls::Box
     std::vector<std::string> media_urls_;
     std::shared_ptr<std::atomic_uint64_t> screenshot_generation_ =
         std::make_shared<std::atomic_uint64_t>(0);
+    std::shared_ptr<std::atomic_bool> alive_ =
+        std::make_shared<std::atomic_bool>(true);
     size_t screenshot_index_ = 0;
     size_t selected_variant_index_ = 0;
     bool launcher_preference_loaded_ = false;

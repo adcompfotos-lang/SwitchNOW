@@ -4,6 +4,7 @@
 #include "cover_image_cache.hpp"
 #include "stream_settings.hpp"
 #include "localization.hpp"
+#include "membership_tier_style.hpp"
 #include <borealis/core/application.hpp>
 #include <borealis/core/theme.hpp>
 #include <borealis/core/logger.hpp>
@@ -243,17 +244,24 @@ void TopBarFrame::UpdateStatusBar()
             status_label_->setText(status);
             displayed_status_ = status;
         }
+        status_label_->setTextColor(membership::TextColor({}));
         return;
     }
 
     const AuthSession& session = *state.session();
-    const std::string tier = session.user.membership_tier.empty() ? std::string("FREE") : session.user.membership_tier;
+    const std::string tier = session.user.membership_tier_verified
+        ? session.user.membership_tier
+        : Tr("Unknown");
     const std::string status = session.user.display_name + " | " + tier + " | " + settings.label;
     if (status != displayed_status_)
     {
         status_label_->setText(status);
         displayed_status_ = status;
     }
+    status_label_->setTextColor(membership::TextColor(
+        session.user.membership_tier_verified
+            ? session.user.membership_tier
+            : std::string {}));
 
     const std::string avatar_url = ResolveAvatarUrl(session.user);
     if (!avatar_url.empty())

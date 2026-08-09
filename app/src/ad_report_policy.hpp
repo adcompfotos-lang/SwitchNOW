@@ -24,13 +24,21 @@ inline SessionAdReport Finished(
     SessionAdReport report;
     report.ad_id = ad_id;
     report.action = SessionAdAction::Finish;
-    // Container timestamps can end a few milliseconds before the declared ad
-    // duration. Once playback reaches EOF successfully, report the advertised
-    // duration just like an HTML media element's ended event does.
-    report.watched_time_ms = std::max(
-        {0, watched_time_ms, expected_duration_ms});
+    // Match the browser implementation: report the observed playback clock,
+    // not an inflated declared duration. Clamp small container overruns to the
+    // advertised length because CloudMatch rejects impossible watch times.
+    report.watched_time_ms = std::max(0, watched_time_ms);
+    if (expected_duration_ms > 0)
+        report.watched_time_ms = std::min(
+            report.watched_time_ms, expected_duration_ms);
     report.paused_time_ms = 0;
     return report;
+}
+
+inline bool IsRecoverableTransitionError(const std::string& error)
+{
+    return error.find("INVALID_REQUEST_STATUS") != std::string::npos ||
+           error.find("statusCode=5") != std::string::npos;
 }
 
 inline SessionAdReport Cancelled(

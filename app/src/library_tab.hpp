@@ -28,6 +28,8 @@ class LibraryTab : public brls::Box
     void Logout();
     void ReloadLibrary(bool background = false);
     void BeginSearch();
+    bool ClearSearch();
+    void UpdateSearchUi();
     void RebuildGrid();
     void LoadMore();
     void LoadMoreOrRefresh();
@@ -42,6 +44,7 @@ class LibraryTab : public brls::Box
     std::vector<brls::View*> toolbar_buttons_;
     brls::Label* account_label_         = nullptr;
     brls::Label* status_label_          = nullptr;
+    brls::Label* search_context_label_  = nullptr;
     brls::Button* search_button_        = nullptr;
     brls::Button* filter_button_        = nullptr;
     brls::Button* sort_button_          = nullptr;

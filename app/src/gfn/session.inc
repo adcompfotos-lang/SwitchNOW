@@ -19,6 +19,7 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
         ResetSessionTraceLog(trace_heading);
 
     std::string automatic_region_url;
+    std::string automatic_region_name;
     if (server_location::IsAutomatic(stream_settings.region) &&
         !force_provider_endpoint)
     {
@@ -30,17 +31,50 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
             const auto age =
                 std::chrono::steady_clock::now() -
                 g_region_selection_cache.measured_at;
+            const auto cache_lifetime =
+                g_region_selection_cache.provider_fallback
+                    ? kProviderFallbackCacheLifetime
+                    : kRegionSelectionCacheLifetime;
             if (g_region_selection_cache.provider_url == provider_url &&
-                age < kRegionSelectionCacheLifetime)
+                age < cache_lifetime)
             {
                 automatic_region_url =
                     g_region_selection_cache.selected_url;
+                automatic_region_name =
+                    g_region_selection_cache.selected_name;
                 AppendSessionTraceLog(
-                    "REGION automatic cache hit ageMs=" +
+                    "REGION automatic memory cache hit ageMs=" +
                     std::to_string(
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             age).count()) +
-                    " selected=" + automatic_region_url);
+                    " selected=" + automatic_region_url +
+                    " name=" + automatic_region_name +
+                    " fallback=" +
+                    std::to_string(
+                        g_region_selection_cache.provider_fallback ? 1 : 0));
+            }
+        }
+
+        if (automatic_region_url.empty())
+        {
+            std::lock_guard<std::mutex> lock(g_region_selection_cache.mutex);
+            const PersistedRegionSelection persisted =
+                LoadPersistentRegionSelection(
+                    provider_url, kPersistentRegionCacheLifetimeMs);
+            if (persisted.valid)
+            {
+                automatic_region_url = persisted.selected_url;
+                automatic_region_name = persisted.selected_name;
+                g_region_selection_cache.provider_url = provider_url;
+                g_region_selection_cache.selected_url = persisted.selected_url;
+                g_region_selection_cache.selected_name = persisted.selected_name;
+                g_region_selection_cache.regions = persisted.regions;
+                g_region_selection_cache.measured_at =
+                    std::chrono::steady_clock::now();
+                g_region_selection_cache.provider_fallback = false;
+                AppendSessionTraceLog(
+                    "REGION automatic persistent cache hit selected=" +
+                    automatic_region_url + " name=" + automatic_region_name);
             }
         }
 
@@ -59,27 +93,29 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
                         " scoreMs=" +
                         std::to_string(region.selection_score_ms) +
                         " probes=" +
-                        std::to_string(region.successful_probes) + "/5" +
+                        std::to_string(region.successful_probes) + "/" +
+                        std::to_string(region.attempted_probes) +
                         " url=" + region.url);
                 }
                 automatic_region_url =
                     server_location::SelectBestMeasuredRegionUrl(measured);
+                const auto selected = std::find_if(
+                    measured.begin(), measured.end(),
+                    [&automatic_region_url](const StreamRegion& region) {
+                        return server_location::NormalizeStreamingBaseUrl(
+                                   region.url) == automatic_region_url;
+                    });
+                if (selected != measured.end())
+                    automatic_region_name = selected->name;
                 AppendSessionTraceLog(
                     "REGION automatic selected=" +
                     (automatic_region_url.empty()
                          ? std::string("provider-default")
-                         : automatic_region_url));
+                         : automatic_region_url) +
+                    " name=" + automatic_region_name);
 
                 if (!automatic_region_url.empty())
-                {
-                    std::lock_guard<std::mutex> lock(
-                        g_region_selection_cache.mutex);
-                    g_region_selection_cache.provider_url = provider_url;
-                    g_region_selection_cache.selected_url =
-                        automatic_region_url;
-                    g_region_selection_cache.measured_at =
-                        std::chrono::steady_clock::now();
-                }
+                    SaveStreamRegionMeasurements(session, measured);
             }
             catch (const std::exception& e)
             {
@@ -204,6 +240,9 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
 
     SessionInfo info;
     info.app_patching = app_patching;
+    info.requested_region_url = streaming_base_url;
+    json_t* request_status = json_object_get(root.get(), "requestStatus");
+    info.assigned_server_id = GetString(request_status, "serverId");
     CollectIceServersFromObject(root.get(), info);
     
     json_t* sess = json_object_get(root.get(), "session");
@@ -329,8 +368,10 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
                 g_region_selection_cache.mutex);
             g_region_selection_cache.provider_url = provider_base_url;
             g_region_selection_cache.selected_url = provider_base_url;
+            g_region_selection_cache.selected_name = "NVIDIA automatic routing";
             g_region_selection_cache.measured_at =
                 std::chrono::steady_clock::now();
+            g_region_selection_cache.provider_fallback = true;
         }
         AppendSessionTraceLog(
             "POLL automatic region lost session; provider fallback requested "
@@ -382,6 +423,11 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
     SessionInfo info;
     info.session_id = session_id;
     info.app_patching = app_patching;
+    info.requested_region_url = base_url;
+    json_t* response_request_status =
+        json_object_get(root.get(), "requestStatus");
+    info.assigned_server_id =
+        GetString(response_request_status, "serverId");
     CollectIceServersFromObject(root.get(), info);
     
     json_t* sess = json_object_get(root.get(), "session");
@@ -416,7 +462,8 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
 SessionInfo GfnClient::ReportSessionAd(
     AuthSession& session,
     const std::string& session_id,
-    const SessionAdReport& report) const
+    const SessionAdReport& report,
+    const std::string& server_ip) const
 {
     if (session_id.empty() || report.ad_id.empty())
         throw std::runtime_error("Cannot report an advertisement without a session and ad ID");
@@ -425,10 +472,32 @@ SessionInfo GfnClient::ReportSessionAd(
     std::string jwt_token = ResolveSessionJwt(session);
     const std::string active_base_url =
         LoadActiveCloudSessionBaseUrl(session, session_id);
-    const std::string base_url = active_base_url.empty()
+    std::string base_url = active_base_url.empty()
         ? server_location::ResolveStreamingBaseUrl(
               "Auto", session.provider.streaming_service_url)
         : active_base_url;
+    std::string endpoint_source = active_base_url.empty()
+        ? "provider" : "tracked_region";
+
+    // NVIDIA's queue-ad state is owned by the CloudMatch node assigned to the
+    // session. Sending the update through the regional load balancer can hit a
+    // different backend and intermittently return INVALID_REQUEST_STATUS on
+    // the first launch. Alliance providers keep their own routing contract.
+    const bool official_nvidia =
+        session.provider.code == "NVIDIA" ||
+        session.provider.streaming_service_url.find("nvidiagrid.net") !=
+            std::string::npos;
+    const bool has_scheme =
+        HasPrefix(server_ip, "https://") || HasPrefix(server_ip, "http://");
+    const bool usable_server =
+        !server_ip.empty() &&
+        server_ip.find_first_of(" \t\r\n?#") == std::string::npos;
+    if (official_nvidia && usable_server)
+    {
+        base_url = EnsureTrailingSlash(
+            has_scheme ? server_ip : "https://" + server_ip);
+        endpoint_source = "assigned_server";
+    }
     const std::string url = base_url + "v2/session/" + session_id;
 
     std::vector<std::string> headers = {
@@ -480,7 +549,9 @@ SessionInfo GfnClient::ReportSessionAd(
         "AD update action=" +
         std::to_string(static_cast<int>(report.action)) +
         " watchedMs=" + std::to_string(report.watched_time_ms) +
-        " pausedMs=" + std::to_string(report.paused_time_ms));
+        " pausedMs=" + std::to_string(report.paused_time_ms) +
+        " endpoint=" + endpoint_source +
+        " host=" + base_url);
     HttpResponse response = http_client_.Request(
         "PUT", url, kUserAgent, headers, body);
     if (response.status_code == 401)

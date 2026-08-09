@@ -18,6 +18,7 @@ void SetCachedGalleryImage(
     std::function<bool()> should_apply = {});
 void PrefetchCachedGalleryImage(const std::string& image_url);
 void SetCachedAvatarImage(brls::Image* image, const std::string& image_url);
+std::string LoadCachedImageData(const std::string& image_url);
 void ShutdownImageCache();
 
 } // namespace opennow

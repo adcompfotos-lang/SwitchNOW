@@ -2,12 +2,18 @@
 
 #include "app_state.hpp"
 #include "app_paths.hpp"
+#include "app_version.hpp"
 #include "localization.hpp"
+#include "membership_tier_policy.hpp"
+#include "membership_tier_style.hpp"
 #include "network_utils.hpp"
+#include "runtime_journal.hpp"
 #include "server_location_policy.hpp"
 #include "stream_settings.hpp"
 #include "stream_settings_policy.hpp"
 #include "stream_diagnostics.hpp"
+#include "subscription_display.hpp"
+#include "update_service.hpp"
 #include "ui_action_guard.hpp"
 #include "ui_helpers.hpp"
 
@@ -408,7 +414,10 @@ brls::Box* SettingsTab::MakeActionRow(
     return row;
 }
 
-void SettingsTab::AddInfoLine(brls::Box* parent, const std::string& label, const std::string& value)
+brls::Label* SettingsTab::AddInfoLine(
+    brls::Box* parent,
+    const std::string& label,
+    const std::string& value)
 {
     auto* row = new brls::Box(brls::Axis::ROW);
     row->setHeight(40);
@@ -428,6 +437,7 @@ void SettingsTab::AddInfoLine(brls::Box* parent, const std::string& label, const
     text->setTextColor(nvgRGB(210, 216, 225));
     row->addView(text);
     parent->addView(row);
+    return text;
 }
 
 void SettingsTab::SelectCategory(Category category)
@@ -487,6 +497,11 @@ void SettingsTab::RebuildCategory()
     if (!content_container_)
         return;
 
+    const size_t selected = static_cast<size_t>(category_);
+    brls::View* fallback = selected < category_buttons_.size()
+        ? static_cast<brls::View*>(category_buttons_[selected])
+        : static_cast<brls::View*>(this);
+    MoveFocusBeforeDestroy(content_container_, fallback);
     option_values_.clear();
     content_container_->clearViews();
     switch (category_)
@@ -518,6 +533,25 @@ void SettingsTab::RebuildCategory()
     UpdateOptionValues();
 }
 
+void SettingsTab::ScheduleCategoryRebuild()
+{
+    if (rebuild_scheduled_)
+        return;
+
+    rebuild_scheduled_ = true;
+    const auto alive = alive_;
+    brls::sync([this, alive] {
+        if (!alive->load(std::memory_order_acquire))
+            return;
+
+        rebuild_scheduled_ = false;
+        RebuildCategory();
+        const size_t selected = static_cast<size_t>(category_);
+        if (selected < category_buttons_.size())
+            brls::Application::giveFocus(category_buttons_[selected]);
+    });
+}
+
 void SettingsTab::BuildAccountPage()
 {
     const auto& state = AppState::Instance();
@@ -532,13 +566,56 @@ void SettingsTab::BuildAccountPage()
         const AuthSession& session = *state.session();
         const bool password_saved = client_.LoadNativeCredentials(session.provider.idp_id).has_value();
         AddInfoLine(overview, "User", session.user.display_name);
-        AddInfoLine(overview, "Membership", session.user.membership_tier.empty() ? "Unknown" : session.user.membership_tier);
+        auto* membership_value = AddInfoLine(
+            overview,
+            "Membership",
+            session.user.membership_tier_verified
+                ? session.user.membership_tier
+                : Tr("Unknown"));
+        membership_value->setTextColor(membership::TextColor(
+            session.user.membership_tier_verified
+                ? session.user.membership_tier
+                : std::string {}));
         AddInfoLine(overview, "Provider", session.provider.display_name);
         AddInfoLine(overview, "Authentication", FormatTokenState(session));
         AddInfoLine(overview, "Quick sign-in", password_saved ? "Password saved" : "Password not saved");
     }
     AddInfoLine(overview, "Saved accounts", std::to_string(client_.LoadSavedSessions().size()));
     content_container_->addView(overview);
+
+    if (state.HasSession())
+    {
+        const AuthSession& active = *state.session();
+        auto* subscription_section = MakeSection(
+            "GeForce NOW subscription",
+            "Usage information reported by NVIDIA for this account.");
+        auto* tier_value = AddInfoLine(
+            subscription_section,
+            "Service level",
+            active.user.membership_tier_verified
+                ? active.user.membership_tier
+                : Tr("Unknown"));
+        tier_value->setTextColor(membership::TextColor(
+            active.user.membership_tier_verified
+                ? active.user.membership_tier
+                : std::string {}));
+        AddInfoLine(
+            subscription_section,
+            "Time remaining",
+            subscription::FormatTimeRemaining(active.subscription));
+        AddInfoLine(
+            subscription_section,
+            "Cloud storage remaining",
+            subscription::FormatStorageRemaining(active.subscription));
+        if (active.subscription.has_storage)
+        {
+            AddInfoLine(
+                subscription_section,
+                "Cloud storage usage",
+                subscription::FormatStorageUsage(active.subscription));
+        }
+        content_container_->addView(subscription_section);
+    }
 
     auto* session = MakeSection("Session", "Account actions take effect immediately and do not require X.");
     session->addView(MakeActionRow(
@@ -736,10 +813,109 @@ void SettingsTab::BuildInterfacePage()
         [this](brls::View* view) { return ChooseInterfaceLanguage(view); }));
     content_container_->addView(language);
 
+    auto* updates = MakeSection(
+        "Updates",
+        "Updates are checked only when you choose this action.");
+    AddInfoLine(updates, "Installed version", kAppVersion);
+    updates->addView(MakeActionRow(
+        "Check for updates",
+        "Check the official SwitchNOW GitHub release and install a newer NRO safely.",
+        "Check",
+        [this](brls::View* view) { return CheckForUpdates(view); }));
+    content_container_->addView(updates);
+
     auto* about = MakeSection("SwitchNOW", "Native GeForce NOW client for Nintendo Switch.");
-    AddInfoLine(about, "Version", "1.1.7");
+    AddInfoLine(about, "Version", kAppVersion);
     AddInfoLine(about, "Languages", "English + 7");
     content_container_->addView(about);
+}
+
+bool SettingsTab::CheckForUpdates(brls::View* view)
+{
+    (void)view;
+    const auto alive = alive_;
+    brls::Application::notify(Tr("Checking for updates..."));
+    LogRuntimeEvent("update", "check", std::string("current=") + kAppVersion);
+
+    brls::async(
+        [alive] {
+            update::CheckResult result = update::CheckLatestRelease(kAppVersion);
+            brls::sync([alive, result = std::move(result)]() mutable {
+                if (!alive->load(std::memory_order_acquire))
+                    return;
+                if (!result.ok)
+                {
+                    LogRuntimeEvent("update", "check_failed", result.error);
+                    ShowError(Tr("Update check failed"), result.error);
+                    return;
+                }
+                if (!result.update_available)
+                {
+                    LogRuntimeEvent(
+                        "update", "up_to_date",
+                        std::string("current=") + kAppVersion +
+                            " latest=" + result.release.version);
+                    ShowDialog(
+                        Tr("SwitchNOW is up to date"),
+                        TrFormat(
+                            "You already have the latest version ({0}).",
+                            {kAppVersion}));
+                    return;
+                }
+
+                const update::ReleaseInfo release = result.release;
+                auto* dialog = new brls::Dialog(
+                    Tr("Update available") + "\n\n" +
+                    TrFormat(
+                        "Version {0} is available. Installed version: {1}.",
+                        {release.version, kAppVersion}) + "\n\n" +
+                    Tr("Download and install it now?"));
+                dialog->addButton(Tr("Install"), [alive, release] {
+                    if (!alive->load(std::memory_order_acquire))
+                        return;
+                    brls::Application::notify(Tr("Downloading update..."));
+                    brls::async(
+                        [alive, release] {
+                            std::string error;
+                            const bool staged = update::StageRelease(
+                                release, {}, error);
+                            brls::sync([alive, release, staged, error] {
+                                if (!alive->load(std::memory_order_acquire))
+                                    return;
+                                if (!staged)
+                                {
+                                    LogRuntimeEvent(
+                                        "update", "stage_failed", error);
+                                    ShowError(Tr("Update installation failed"), error);
+                                    return;
+                                }
+
+                                auto* ready = new brls::Dialog(
+                                    Tr("Update ready") + "\n\n" +
+                                    TrFormat(
+                                        "Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.",
+                                        {release.version}));
+                                ready->addButton(Tr("Install update"), [] {
+                                    std::string launch_error;
+                                    if (!update::LaunchUpdateHelper(launch_error))
+                                        ShowError(
+                                            Tr("Update installation failed"),
+                                            launch_error);
+                                });
+                                ready->addButton(Tr("Later"), [] {});
+                                ready->setCancelable(true);
+                                ready->open();
+                            });
+                        },
+                        false);
+                });
+                dialog->addButton(Tr("Later"), [] {});
+                dialog->setCancelable(true);
+                dialog->open();
+            });
+        },
+        false);
+    return true;
 }
 
 void SettingsTab::UpdateOptionValues()
@@ -766,8 +942,6 @@ bool SettingsTab::SaveChanges(brls::View* view)
         return true;
     }
 
-    const bool language_changed =
-        draft_settings_.interface_language != saved_settings_.interface_language;
     if (!SaveStreamSettings(draft_settings_))
     {
         ShowError("Settings Save Failed", "Could not safely write stream_settings.json to the SD card.");
@@ -786,22 +960,9 @@ bool SettingsTab::SaveChanges(brls::View* view)
     for (size_t index = 0; index < category_buttons_.size() && index < category_names.size(); ++index)
         category_buttons_[index]->setText(Tr(category_names[index]));
 
-    // Never destroy the focused option row from inside its own X action.
-    // Borealis may still dispatch focus events after this callback returns,
-    // which previously left a dangling focus pointer and caused the crash.
-    if (language_changed)
-    {
-        const auto alive = alive_;
-        const Category selected_category = category_;
-        brls::sync([this, alive, selected_category] {
-            if (!alive->load())
-                return;
-            SelectCategory(selected_category);
-            const size_t selected = static_cast<size_t>(selected_category);
-            if (selected < category_buttons_.size())
-                brls::Application::giveFocus(category_buttons_[selected]);
-        });
-    }
+    // Every save can change labels or summaries. Rebuild only after the X
+    // callback returns, and always move focus away from rows being destroyed.
+    ScheduleCategoryRebuild();
     brls::Application::notify(Tr("Settings saved; changes apply to the next stream"));
     return true;
 }
@@ -903,7 +1064,9 @@ bool SettingsTab::ShowSessionDialog(brls::View* view)
         "Session Details",
         "User: " + session.user.display_name + "\n" +
             "Email: " + (session.user.email.empty() ? std::string("Unavailable") : session.user.email) + "\n" +
-            "Tier: " + session.user.membership_tier + "\n" +
+            "Tier: " + (session.user.membership_tier_verified
+                ? session.user.membership_tier
+                : Tr("Unknown")) + "\n" +
             "Provider: " + session.provider.display_name + "\n" +
             "Authentication: " + FormatTokenState(session) + "\n" +
             "Streaming base: " + session.provider.streaming_service_url + "\n" +
@@ -927,7 +1090,7 @@ bool SettingsTab::TestTokenRefresh(brls::View* view)
         refreshed.reauthentication_required = false;
         state.SetSession(std::move(refreshed));
         RefreshSummary();
-        brls::sync([this] { RebuildCategory(); });
+        ScheduleCategoryRebuild();
         brls::Application::notify("Token refresh and vault rotation completed successfully");
     }
     catch (const ReauthenticationRequired& e)
@@ -936,7 +1099,7 @@ bool SettingsTab::TestTokenRefresh(brls::View* view)
         invalid.reauthentication_required = true;
         state.SetSession(std::move(invalid));
         RefreshSummary();
-        brls::sync([this] { RebuildCategory(); });
+        ScheduleCategoryRebuild();
         ShowError("Token Refresh Requires Login", e.what());
     }
     catch (const std::exception& e)
@@ -974,7 +1137,7 @@ bool SettingsTab::ClearSavedLogin(brls::View* view)
     }
 
     RefreshSummary();
-    brls::sync([this] { RebuildCategory(); });
+    ScheduleCategoryRebuild();
     return true;
 }
 
@@ -1008,7 +1171,7 @@ bool SettingsTab::SwitchSavedAccount(brls::View* view)
             state.SetSession(session);
             state.SetLibraryGames({});
             RefreshSummary();
-            brls::sync([this] { RebuildCategory(); });
+            ScheduleCategoryRebuild();
             brls::Application::notify("Switched to " + session.user.display_name);
         });
     }
@@ -1027,7 +1190,7 @@ bool SettingsTab::ClearAllSavedLogins(brls::View* view)
     state.ClearSession();
     state.SetLibraryGames({});
     RefreshSummary();
-    brls::sync([this] { RebuildCategory(); });
+    ScheduleCategoryRebuild();
     brls::Application::notify("All saved GeForce NOW logins cleared");
     return true;
 }
@@ -1036,7 +1199,7 @@ bool SettingsTab::ClearSavedPasswords(brls::View* view)
 {
     (void)view;
     client_.ClearAllNativeCredentials();
-    brls::sync([this] { RebuildCategory(); });
+    ScheduleCategoryRebuild();
     brls::Application::notify("All saved NVIDIA passwords were removed; OAuth sessions remain connected");
     return true;
 }
@@ -1063,7 +1226,7 @@ bool SettingsTab::ClearCoverCache(brls::View* view)
 
     const size_t removed = ClearImageCacheFiles();
     RefreshSummary();
-    brls::sync([this] { RebuildCategory(); });
+    ScheduleCategoryRebuild();
     brls::Application::notify("Removed " + std::to_string(removed) + " cached cover files");
     return true;
 }
@@ -1141,8 +1304,68 @@ void SettingsTab::BeginServerLocationLoad(
                 GfnClient client;
                 std::vector<StreamRegion> regions =
                     client.FetchStreamRegions(session);
+                const std::vector<StreamRegion> cached =
+                    client.LoadCachedStreamRegions(session);
+                for (StreamRegion& region : regions)
+                {
+                    const auto match = std::find_if(
+                        cached.begin(), cached.end(),
+                        [&region](const StreamRegion& cached_region) {
+                            return cached_region.url == region.url;
+                        });
+                    if (match != cached.end())
+                    {
+                        region.ping_ms = match->ping_ms;
+                        region.jitter_ms = match->jitter_ms;
+                        region.selection_score_ms =
+                            match->selection_score_ms;
+                        region.successful_probes =
+                            match->successful_probes;
+                        region.attempted_probes =
+                            match->attempted_probes;
+                    }
+                }
+
+                // Publish advertised locations immediately. Cached RTT values
+                // make this useful before the background refinement finishes.
+                std::vector<StreamRegion> immediate_regions = regions;
+                std::stable_sort(
+                    immediate_regions.begin(), immediate_regions.end(),
+                    [](const StreamRegion& left, const StreamRegion& right) {
+                        const bool left_ok = left.ping_ms >= 0;
+                        const bool right_ok = right.ping_ms >= 0;
+                        if (left_ok != right_ok)
+                            return left_ok;
+                        const int left_score =
+                            server_location::RegionSelectionScore(left);
+                        const int right_score =
+                            server_location::RegionSelectionScore(right);
+                        if (left_ok && left_score != right_score)
+                            return left_score < right_score;
+                        return left.name < right.name;
+                    });
+                brls::sync(
+                    [this, alive,
+                     regions = std::move(immediate_regions)]() mutable {
+                        if (!alive->load(std::memory_order_acquire))
+                            return;
+
+                        server_locations_ = std::move(regions);
+                        server_locations_loaded_ = true;
+                        UpdateOptionValues();
+                        const bool should_open =
+                            open_server_location_when_ready_ &&
+                            category_ == Category::Stream;
+                        if (should_open)
+                        {
+                            open_server_location_when_ready_ = false;
+                            ChooseServerLocation(nullptr);
+                        }
+                    });
+
                 regions =
                     client.MeasureStreamRegionLatencies(std::move(regions));
+                client.SaveStreamRegionMeasurements(session, regions);
                 std::stable_sort(
                     regions.begin(),
                     regions.end(),
@@ -1236,10 +1459,10 @@ void SettingsTab::BeginServerLocationLoad(
 bool SettingsTab::ChooseServerLocation(brls::View* view)
 {
     (void)view;
-    if (server_locations_loading_)
+    if (server_locations_loading_ && !server_locations_loaded_)
     {
         open_server_location_when_ready_ = true;
-        brls::Application::notify(Tr("Testing GeForce NOW server locations..."));
+        brls::Application::notify(Tr("Loading GeForce NOW server locations..."));
         return true;
     }
 
@@ -1287,6 +1510,8 @@ bool SettingsTab::ChooseServerLocation(brls::View* view)
         std::string label = region.name;
         if (region.ping_ms >= 0)
             label += " - ~" + std::to_string(region.ping_ms) + " ms";
+        else if (server_locations_loading_)
+            label += " - " + Tr("Testing locations...");
         else
             label += " - " + Tr("Unavailable");
         if (best != server_locations_.end() && region.url == best->url)

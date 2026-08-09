@@ -1,5 +1,6 @@
 # Build and packaging output
 /build/
+/build-host-tests/
 /dist/
 /SwitchNOW-main/
 /SwitchNOW-release/

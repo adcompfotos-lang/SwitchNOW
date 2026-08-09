@@ -8,6 +8,7 @@ namespace
 {
 struct RegionCandidate
 {
+    std::string name;
     std::string url;
     int ping_ms;
     int selection_score_ms = -1;
@@ -52,16 +53,16 @@ int main()
         "https://prod.example/");
 
     const std::vector<RegionCandidate> regions = {
-        {"https://np-lon.example", 28},
-        {"https://np-ams.example", 10},
-        {"https://np-par.example", -1},
-        {"http://unsafe.example", 2},
+        {"London", "https://np-lon.example", 28},
+        {"Amsterdam", "https://np-ams.example", 10},
+        {"Paris", "https://np-par.example", -1},
+        {"Unsafe", "http://unsafe.example", 2},
     };
     assert(
         SelectBestMeasuredRegionUrl(regions) ==
         "https://np-ams.example/");
     const std::vector<RegionCandidate> unavailable_regions = {
-        {"https://np-par.example", -1},
+        {"Paris", "https://np-par.example", -1},
     };
     assert(SelectBestMeasuredRegionUrl(unavailable_regions).empty());
 
@@ -77,11 +78,29 @@ int main()
     assert(incomplete.selection_score_ms > stable.selection_score_ms);
 
     const std::vector<RegionCandidate> scored_regions = {
-        {"https://fast-but-unstable.example", 28, 80},
-        {"https://stable.example", 38, 40},
+        {"Unstable", "https://fast-but-unstable.example", 28, 80},
+        {"Stable", "https://stable.example", 38, 40},
     };
     assert(
         SelectBestMeasuredRegionUrl(scored_regions) ==
         "https://stable.example/");
+
+    const std::vector<RegionCandidate> coarse_regions = {
+        {"Bulgaria", "https://np-sof.example", 15},
+        {"Frankfurt", "https://np-fra.example", 31},
+        {"London", "https://np-lon.example", 72},
+        {"Invalid", "http://invalid.example", 1},
+        {"Offline", "https://offline.example", -1},
+    };
+    const std::vector<size_t> finalists =
+        SelectLatencyFinalists(coarse_regions, 5, 35);
+    assert(finalists.size() == 2);
+    assert(finalists[0] == 0);
+    assert(finalists[1] == 1);
+
+    const std::vector<size_t> one_finalist =
+        SelectLatencyFinalists(coarse_regions, 1, 100);
+    assert(one_finalist.size() == 1);
+    assert(one_finalist[0] == 0);
     return 0;
 }

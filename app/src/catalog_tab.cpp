@@ -58,6 +58,28 @@ bool ContainsText(const std::string& haystack, const std::string& needle)
     return ToLower(haystack).find(ToLower(needle)) != std::string::npos;
 }
 
+std::string CompactSearchQuery(const std::string& text, size_t max_codepoints = 19)
+{
+    size_t offset = 0;
+    size_t count = 0;
+    while (offset < text.size() && count < max_codepoints)
+    {
+        const unsigned char lead = static_cast<unsigned char>(text[offset]);
+        size_t length = 1;
+        if ((lead & 0xE0) == 0xC0)
+            length = 2;
+        else if ((lead & 0xF0) == 0xE0)
+            length = 3;
+        else if ((lead & 0xF8) == 0xF0)
+            length = 4;
+        if (offset + length > text.size())
+            length = 1;
+        offset += length;
+        ++count;
+    }
+    return offset < text.size() ? text.substr(0, offset) + "..." : text;
+}
+
 bool MatchesStoreFilter(const PublicGame& game, size_t filter_index)
 {
     if (filter_index == 0 || filter_index >= kStoreFilters.size())
@@ -122,6 +144,12 @@ CatalogTab::CatalogTab()
         return RunUiAction("catalog.more.button", [this]() { LoadMoreOrRefresh(); });
     });
 
+    search_context_label_ = MakeParagraph("", 5.0f);
+    search_context_label_->setFontSize(16.0f);
+    search_context_label_->setTextColor(nvgRGB(88, 230, 146));
+    search_context_label_->setVisibility(brls::Visibility::GONE);
+    addView(search_context_label_);
+
     status_label_ = MakeParagraph("Loading the supported GeForce NOW catalog...", 8.0f);
     status_label_->setFontSize(14);
     status_label_->setTextColor(nvgRGB(132, 139, 151));
@@ -156,6 +184,12 @@ CatalogTab::CatalogTab()
         (void)view;
         return RunUiAction("catalog.sort.hotkey", [this]() { CycleSortMode(); });
     }, false, false);
+
+    registerAction(Tr("Clear search"), brls::BUTTON_B, [this](brls::View*) {
+        if (search_query_.empty())
+            return false;
+        return RunUiAction("catalog.search.clear", [this]() { ClearSearch(); });
+    }, false, false);
 }
 
 CatalogTab::~CatalogTab()
@@ -175,7 +209,9 @@ void CatalogTab::BeginSearch()
             RunUiAction("catalog.search.result", [this, text = std::move(text)]() mutable {
                 MoveFocusBeforeDestroy(list_container_, search_button_);
                 search_query_ = std::move(text);
+                ++search_generation_;
                 page_index_ = 0;
+                UpdateSearchUi();
                 if (search_query_.empty() && !base_games_.empty())
                 {
                     games_ = base_games_;
@@ -191,13 +227,53 @@ void CatalogTab::BeginSearch()
                 }
             });
         },
-        "Search Catalog", "Enter a title to filter games", 64, search_query_);
+        Tr("Search Catalog"), Tr("Enter a title to filter games"), 64, search_query_);
+}
+
+bool CatalogTab::ClearSearch()
+{
+    if (search_query_.empty())
+        return false;
+
+    MoveFocusBeforeDestroy(list_container_, search_button_);
+    search_query_.clear();
+    ++search_generation_;
+    page_index_ = 0;
+    if (!base_games_.empty())
+        games_ = base_games_;
+    UpdateSearchUi();
+    RebuildList();
+    brls::Application::giveFocus(search_button_);
+    return true;
+}
+
+void CatalogTab::UpdateSearchUi()
+{
+    if (!search_button_ || !search_context_label_)
+        return;
+
+    if (search_query_.empty())
+    {
+        search_button_->setText("Y  " + Tr("Search"));
+        search_button_->setStyle(&brls::BUTTONSTYLE_HIGHLIGHT);
+        search_context_label_->setText("");
+        search_context_label_->setVisibility(brls::Visibility::GONE);
+        return;
+    }
+
+    const std::string compact_query = CompactSearchQuery(search_query_);
+    search_button_->setText("Y  " + Tr("Search") + ": " + compact_query);
+    search_button_->setStyle(&brls::BUTTONSTYLE_PRIMARY);
+    search_context_label_->setText(
+        TrFormat("Searching for: {0}", {search_query_}) + "  |  " + Tr("B  Clear search"));
+    search_context_label_->setVisibility(brls::Visibility::VISIBLE);
 }
 
 void CatalogTab::willAppear(bool resetState)
 {
     brls::Box::willAppear(resetState);
 
+    UpdateSearchUi();
     const auto& state = AppState::Instance();
     if (games_.empty() && state.HasPublicGames())
     {
@@ -217,6 +293,7 @@ void CatalogTab::ReloadCatalog(const std::string& server_query)
         return;
 
     loading_ = true;
+    const std::uint64_t request_generation = search_generation_;
     status_label_->setText(server_query.empty()
         ? "Loading current GeForce NOW catalog..."
         : "Searching the GeForce NOW catalog...");
@@ -227,16 +304,24 @@ void CatalogTab::ReloadCatalog(const std::string& server_query)
     AuthSession session;
     if (authenticated)
         session = *AppState::Instance().session();
-    brls::async([this, alive, client, authenticated, session = std::move(session), server_query]() mutable {
+    brls::async([this, alive, client, authenticated, session = std::move(session), server_query,
+                 request_generation]() mutable {
         try
         {
             std::vector<PublicGame> games = authenticated
                 ? client.FetchCatalogGames(session, server_query)
                 : client.FetchPublicGames();
             brls::sync([this, alive, authenticated, games = std::move(games),
-                        session = std::move(session), server_query]() mutable {
+                        session = std::move(session), server_query, request_generation]() mutable {
                 if (!alive->load())
                     return;
+                if (request_generation != search_generation_)
+                {
+                    loading_ = false;
+                    if (!search_query_.empty())
+                        ReloadCatalog(search_query_);
+                    return;
+                }
                 games_ = std::move(games);
                 if (authenticated)
                     AppState::Instance().SetSession(std::move(session));
@@ -256,9 +341,16 @@ void CatalogTab::ReloadCatalog(const std::string& server_query)
         catch (const std::exception& ex)
         {
             const std::string error = ex.what();
-            brls::sync([this, alive, error]() {
+            brls::sync([this, alive, error, request_generation]() {
                 if (!alive->load())
                     return;
+                if (request_generation != search_generation_)
+                {
+                    loading_ = false;
+                    if (!search_query_.empty())
+                        ReloadCatalog(search_query_);
+                    return;
+                }
                 loading_ = false;
                 status_label_->setText("Catalog request failed. Press X to retry.");
                 ShowError("Catalog Request Failed", error);
@@ -326,8 +418,11 @@ void CatalogTab::RebuildList()
     status += " " + TrFormat(
         "Sort: {0}.", {Tr(kCatalogSortModes[sort_mode_index_])});
     if (!search_query_.empty())
+    {
+        status += " " + TrFormat("Searching for: {0}", {search_query_});
         status += " " + TrFormat(
             "Found {0} matches.", {std::to_string(filtered_count_)});
+    }
     if (filtered_count_ > 0)
         status += " " + TrFormat(
             "Showing {0}-{1} of {2} (page {3}/{4}).",

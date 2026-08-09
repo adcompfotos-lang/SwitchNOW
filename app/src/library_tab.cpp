@@ -11,6 +11,7 @@
 #include "ui_helpers.hpp"
 #include "qr_login_dialog.hpp"
 #include "localization.hpp"
+#include "membership_tier_style.hpp"
 
 #include <algorithm>
 #include <array>
@@ -62,6 +63,28 @@ std::string ToLower(std::string value)
 bool ContainsText(const std::string& haystack, const std::string& needle)
 {
     return ToLower(haystack).find(ToLower(needle)) != std::string::npos;
+}
+
+std::string CompactSearchQuery(const std::string& text, size_t max_codepoints = 19)
+{
+    size_t offset = 0;
+    size_t count = 0;
+    while (offset < text.size() && count < max_codepoints)
+    {
+        const unsigned char lead = static_cast<unsigned char>(text[offset]);
+        size_t length = 1;
+        if ((lead & 0xE0) == 0xC0)
+            length = 2;
+        else if ((lead & 0xF0) == 0xE0)
+            length = 3;
+        else if ((lead & 0xF8) == 0xF0)
+            length = 4;
+        if (offset + length > text.size())
+            length = 1;
+        offset += length;
+        ++count;
+    }
+    return offset < text.size() ? text.substr(0, offset) + "..." : text;
 }
 
 std::string PrimaryStore(const GameInfo& game)
@@ -185,6 +208,11 @@ LibraryTab::LibraryTab()
         return RunUiAction("library.more.button", [this]() { LoadMoreOrRefresh(); });
     });
 
+    search_context_label_ = MakeParagraph("", 5.0f, 16.0f);
+    search_context_label_->setTextColor(nvgRGB(88, 230, 146));
+    search_context_label_->setVisibility(brls::Visibility::GONE);
+    addView(search_context_label_);
+
     status_label_ = MakeParagraph("Sign in to load your GeForce NOW library.", 8.0f, 14.0f);
     status_label_->setTextColor(nvgRGB(132, 139, 151));
     addView(status_label_);
@@ -218,6 +246,12 @@ LibraryTab::LibraryTab()
         (void)view;
         return RunUiAction("library.sort.hotkey", [this]() { CycleSortMode(); });
     }, false, false);
+
+    registerAction(Tr("Clear search"), brls::BUTTON_B, [this](brls::View*) {
+        if (search_query_.empty())
+            return false;
+        return RunUiAction("library.search.clear", [this]() { ClearSearch(); });
+    }, false, false);
 }
 
 LibraryTab::~LibraryTab()
@@ -238,16 +272,54 @@ void LibraryTab::BeginSearch()
                 MoveFocusBeforeDestroy(grid_container_, search_button_);
                 search_query_ = std::move(text);
                 visible_limit_ = kInitialVisibleLibraryLimit;
+                UpdateSearchUi();
                 RebuildGrid();
             });
         },
-        "Search Library", "Enter a title to filter your games", 64, search_query_);
+        Tr("Search Library"), Tr("Enter a title to filter your games"), 64, search_query_);
+}
+
+bool LibraryTab::ClearSearch()
+{
+    if (search_query_.empty())
+        return false;
+
+    MoveFocusBeforeDestroy(grid_container_, search_button_);
+    search_query_.clear();
+    visible_limit_ = kInitialVisibleLibraryLimit;
+    UpdateSearchUi();
+    RebuildGrid();
+    brls::Application::giveFocus(search_button_);
+    return true;
+}
+
+void LibraryTab::UpdateSearchUi()
+{
+    if (!search_button_ || !search_context_label_)
+        return;
+
+    if (search_query_.empty())
+    {
+        search_button_->setText("Y  " + Tr("Search"));
+        search_button_->setStyle(&brls::BUTTONSTYLE_HIGHLIGHT);
+        search_context_label_->setText("");
+        search_context_label_->setVisibility(brls::Visibility::GONE);
+        return;
+    }
+
+    const std::string compact_query = CompactSearchQuery(search_query_);
+    search_button_->setText("Y  " + Tr("Search") + ": " + compact_query);
+    search_button_->setStyle(&brls::BUTTONSTYLE_PRIMARY);
+    search_context_label_->setText(
+        TrFormat("Searching for: {0}", {search_query_}) + "  |  " + Tr("B  Clear search"));
+    search_context_label_->setVisibility(brls::Visibility::VISIBLE);
 }
 
 void LibraryTab::willAppear(bool resetState)
 {
     brls::Box::willAppear(resetState);
 
+    UpdateSearchUi();
     EnsureSessionLoaded();
     UpdateSessionUi();
 
@@ -287,6 +359,7 @@ void LibraryTab::UpdateSessionUi()
     const auto& state = AppState::Instance();
     if (!state.HasSession())
     {
+        account_label_->setTextColor(membership::TextColor({}));
         account_label_->setText(Tr("No GeForce NOW account connected on this Switch yet."));
         status_label_->setText(Tr("Sign in to load your GeForce NOW library."));
         sign_in_button_->setText(Tr("Sign in to GeForce NOW"));
@@ -296,11 +369,13 @@ void LibraryTab::UpdateSessionUi()
     }
 
     const AuthSession& session = *state.session();
-    const std::string membership =
-        session.user.membership_tier.empty() ? std::string("FREE") : session.user.membership_tier;
+    const std::string membership = session.user.membership_tier_verified
+        ? session.user.membership_tier
+        : Tr("Unknown");
 
     if (session.reauthentication_required)
     {
+        account_label_->setTextColor(nvgRGB(255, 170, 174));
         account_label_->setText(TrFormat(
             "Reconnect required for {0}", {session.user.display_name}));
         status_label_->setText(Tr("NVIDIA revoked or expired the saved refresh token."));
@@ -309,6 +384,10 @@ void LibraryTab::UpdateSessionUi()
     }
     else
     {
+        account_label_->setTextColor(membership::TextColor(
+            session.user.membership_tier_verified
+                ? session.user.membership_tier
+                : std::string {}));
         account_label_->setText(TrFormat(
             "Connected as {0}  |  {1} tier",
             {session.user.display_name, membership}));
@@ -506,8 +585,11 @@ void LibraryTab::LoadMore()
     status += " " + TrFormat(
         "Sort: {0}.", {Tr(kLibrarySortModes[sort_mode_index_])});
     if (!search_query_.empty())
+    {
+        status += " " + TrFormat("Searching for: {0}", {search_query_});
         status += " " + TrFormat(
             "Found {0} matches.", {std::to_string(filtered_count_)});
+    }
     if (filtered_count_ > visible_count)
         status += " " + TrFormat(
             "Showing first {0}. Press X or select Show more.",

@@ -514,6 +514,39 @@ void SetCachedAvatarImage(brls::Image* image, const std::string& image_url)
     SetCachedRemoteImage(image, image_url, ImagePriority::Normal);
 }
 
+std::string LoadCachedImageData(const std::string& image_url)
+{
+    if (image_url.empty())
+        return {};
+
+    std::string bytes;
+    if (ReadCachedImage(CachePathForUrl(image_url), bytes))
+        return bytes;
+
+    try
+    {
+        HttpClient http_client;
+        const HttpResponse response = http_client.Get(
+            image_url,
+            GfnClient::kUserAgent,
+            {"Accept: image/jpeg,image/png,image/*,*/*;q=0.8"},
+            5,
+            15);
+        if (response.status_code != 200 || response.body.empty() ||
+            response.body.size() > kMaximumCachedImageSize ||
+            !HasImageSignature(response.body))
+        {
+            return {};
+        }
+        WriteCachedImage(CachePathForUrl(image_url), response.body);
+        return response.body;
+    }
+    catch (...)
+    {
+        return {};
+    }
+}
+
 void ShutdownImageCache()
 {
     ImageLoader* loader = nullptr;

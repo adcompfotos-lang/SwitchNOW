@@ -31,6 +31,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -64,6 +65,7 @@ constexpr const char* kPublicCatalogEndpoint =
 constexpr const char* kTokenEndpoint       = "https://login.nvidia.com/token";
 constexpr const char* kClientTokenEndpoint = "https://login.nvidia.com/client_token";
 constexpr const char* kUserInfoEndpoint    = "https://login.nvidia.com/userinfo";
+constexpr const char* kSubscriptionEndpoint = "https://mes.geforcenow.com/v4/subscriptions";
 constexpr const char* kAuthorizeEndpoint   = "https://login.nvidia.com/authorize";
 constexpr const char* kGraphQlEndpoint     = "https://games.geforce.com/graphql";
 
@@ -86,6 +88,8 @@ constexpr const char* kPlayOrigin        = "https://play.geforcenow.com";
 constexpr const char* kPlayReferer       = "https://play.geforcenow.com/";
 
 constexpr std::int64_t kRefreshWindowMs = 10LL * 60LL * 1000LL;
+constexpr std::int64_t kMembershipRefreshIntervalMs = 60LL * 60LL * 1000LL;
+constexpr std::int64_t kMembershipRetryIntervalMs = 5LL * 60LL * 1000LL;
 std::recursive_mutex g_accounts_mutex;
 std::mutex g_reauthentication_mutex;
 
@@ -94,11 +98,19 @@ struct RegionSelectionCache
     std::mutex mutex;
     std::string provider_url;
     std::string selected_url;
+    std::string selected_name;
+    std::vector<StreamRegion> regions;
     std::chrono::steady_clock::time_point measured_at {};
+    bool provider_fallback = false;
 };
 
 RegionSelectionCache g_region_selection_cache;
-constexpr auto kRegionSelectionCacheLifetime = std::chrono::minutes(5);
+constexpr auto kRegionSelectionCacheLifetime = std::chrono::minutes(30);
+constexpr auto kProviderFallbackCacheLifetime = std::chrono::minutes(5);
+constexpr std::int64_t kPersistentRegionCacheLifetimeMs =
+    60LL * 60LL * 1000LL;
+constexpr std::int64_t kRegionDisplayCacheLifetimeMs =
+    7LL * 24LL * 60LL * 60LL * 1000LL;
 
 std::string Trim(const std::string& value)
 {
@@ -153,6 +165,11 @@ std::string GetActiveCloudSessionPath()
 std::string GetNativeCredentialsPath()
 {
     return GetAppHome() + "/auth_credentials.vault";
+}
+
+std::string GetRegionSelectionCachePath()
+{
+    return GetAppHome() + "/server_region_cache.json";
 }
 
 void EnsureAppHome()
@@ -220,6 +237,106 @@ int GetInteger(json_t* object, const char* key, int fallback = 0)
         return fallback;
 
     return static_cast<int>(json_integer_value(value));
+}
+
+double JsonNumber(json_t* object, const char* key, double fallback = 0.0)
+{
+    if (!object || !json_is_object(object))
+        return fallback;
+
+    json_t* value = json_object_get(object, key);
+    if (json_is_integer(value))
+        return static_cast<double>(json_integer_value(value));
+    if (json_is_real(value))
+        return json_real_value(value);
+    if (!json_is_string(value))
+        return fallback;
+
+    const char* text = json_string_value(value);
+    if (!text || !*text)
+        return fallback;
+    char* end = nullptr;
+    const double parsed = std::strtod(text, &end);
+    return end != text && std::isfinite(parsed) ? parsed : fallback;
+}
+
+std::string AddonAttribute(json_t* addon, const char* key)
+{
+    json_t* attributes = addon ? json_object_get(addon, "attributes") : nullptr;
+    if (!json_is_array(attributes))
+        return {};
+
+    size_t index;
+    json_t* attribute;
+    json_array_foreach(attributes, index, attribute)
+    {
+        if (GetString(attribute, "key") == key)
+            return GetString(attribute, "textValue");
+    }
+    return {};
+}
+
+bool ParseNumberText(const std::string& text, double& output)
+{
+    if (text.empty())
+        return false;
+    char* end = nullptr;
+    const double parsed = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || !std::isfinite(parsed))
+        return false;
+    output = parsed;
+    return true;
+}
+
+SubscriptionInfo ParseSubscription(json_t* root)
+{
+    SubscriptionInfo info;
+    info.available = true;
+    info.membership_tier = Trim(GetString(root, "membershipTier"));
+    info.subscription_type = GetString(root, "type");
+    info.subscription_subtype = GetString(root, "subType");
+
+    const double allotted_minutes = JsonNumber(root, "allottedTimeInMinutes");
+    const double purchased_minutes = JsonNumber(root, "purchasedTimeInMinutes");
+    const double rolled_over_minutes = JsonNumber(root, "rolledOverTimeInMinutes");
+    const double fallback_total = allotted_minutes + purchased_minutes + rolled_over_minutes;
+    const double total_minutes = JsonNumber(root, "totalTimeInMinutes", fallback_total);
+    const double remaining_minutes = JsonNumber(root, "remainingTimeInMinutes");
+
+    info.allotted_hours = allotted_minutes / 60.0;
+    info.purchased_hours = purchased_minutes / 60.0;
+    info.rolled_over_hours = rolled_over_minutes / 60.0;
+    info.total_hours = total_minutes / 60.0;
+    info.remaining_hours = remaining_minutes / 60.0;
+    info.used_hours = std::max(total_minutes - remaining_minutes, 0.0) / 60.0;
+    info.is_unlimited = info.subscription_subtype == "UNLIMITED";
+
+    json_t* addons = root ? json_object_get(root, "addons") : nullptr;
+    if (!json_is_array(addons))
+        return info;
+
+    size_t index;
+    json_t* addon;
+    json_array_foreach(addons, index, addon)
+    {
+        if (GetString(addon, "type") != "STORAGE" ||
+            GetString(addon, "subType") != "PERMANENT_STORAGE" ||
+            GetString(addon, "status") != "OK")
+        {
+            continue;
+        }
+
+        info.has_storage = true;
+        const bool has_size = ParseNumberText(
+            AddonAttribute(addon, "TOTAL_STORAGE_SIZE_IN_GB"), info.storage_size_gb);
+        const bool has_used = ParseNumberText(
+            AddonAttribute(addon, "USED_STORAGE_SIZE_IN_GB"), info.storage_used_gb);
+        info.has_storage_usage = has_size && has_used;
+        info.storage_region_name = AddonAttribute(addon, "STORAGE_METRO_REGION_NAME");
+        info.storage_region_code = AddonAttribute(addon, "STORAGE_METRO_REGION");
+        break;
+    }
+    return info;
 }
 
 bool HasPrefix(const std::string& value, const char* prefix)
@@ -642,6 +759,133 @@ void WriteTextFileAtomically(const std::string& path, const std::string& content
         std::rename(backup.c_str(), path.c_str());
     std::remove(temporary.c_str());
     throw std::runtime_error("Unable to replace " + path);
+}
+
+struct PersistedRegionSelection
+{
+    bool valid = false;
+    std::string provider_url;
+    std::string selected_url;
+    std::string selected_name;
+    std::int64_t measured_at_ms = 0;
+    std::vector<StreamRegion> regions;
+};
+
+PersistedRegionSelection LoadPersistentRegionSelection(
+    const std::string& expected_provider_url,
+    std::int64_t maximum_age_ms)
+{
+    PersistedRegionSelection cache;
+    const std::string body = ReadTextFile(GetRegionSelectionCachePath());
+    if (body.empty())
+        return cache;
+
+    try
+    {
+        JsonPtr root = LoadJson(body);
+        if (GetInteger(root.get(), "schema") != 1)
+            return cache;
+
+        cache.provider_url = server_location::NormalizeStreamingBaseUrl(
+            GetString(root.get(), "provider_url"));
+        cache.selected_url = server_location::NormalizeStreamingBaseUrl(
+            GetString(root.get(), "selected_url"));
+        cache.selected_name = GetString(root.get(), "selected_name");
+        json_t* measured_at = json_object_get(root.get(), "measured_at_ms");
+        if (json_is_integer(measured_at))
+        {
+            cache.measured_at_ms = static_cast<std::int64_t>(
+                json_integer_value(measured_at));
+        }
+
+        const std::string normalized_provider =
+            server_location::NormalizeStreamingBaseUrl(expected_provider_url);
+        const std::int64_t age_ms = std::max<std::int64_t>(
+            0, NowMs() - cache.measured_at_ms);
+        if (cache.provider_url.empty() ||
+            cache.provider_url != normalized_provider ||
+            cache.selected_url.empty() ||
+            cache.measured_at_ms <= 0 ||
+            age_ms > maximum_age_ms)
+        {
+            return {};
+        }
+
+        json_t* entries = json_object_get(root.get(), "regions");
+        if (json_is_array(entries))
+        {
+            size_t index = 0;
+            json_t* entry = nullptr;
+            json_array_foreach(entries, index, entry)
+            {
+                StreamRegion region;
+                region.name = GetString(entry, "name");
+                region.url = server_location::NormalizeStreamingBaseUrl(
+                    GetString(entry, "url"));
+                region.ping_ms = GetInteger(entry, "ping_ms", -1);
+                region.jitter_ms = GetInteger(entry, "jitter_ms", -1);
+                region.selection_score_ms =
+                    GetInteger(entry, "selection_score_ms", -1);
+                region.successful_probes =
+                    GetInteger(entry, "successful_probes", 0);
+                region.attempted_probes =
+                    GetInteger(entry, "attempted_probes", 0);
+                if (!region.name.empty() && !region.url.empty())
+                    cache.regions.push_back(std::move(region));
+            }
+        }
+
+        cache.valid = true;
+    }
+    catch (...)
+    {
+        return {};
+    }
+    return cache;
+}
+
+void SavePersistentRegionSelection(
+    const std::string& provider_url,
+    const std::string& selected_url,
+    const std::string& selected_name,
+    const std::vector<StreamRegion>& regions)
+{
+    JsonPtr root(json_object(), &json_decref);
+    JsonPtr entries(json_array(), &json_decref);
+    json_object_set_new(root.get(), "schema", json_integer(1));
+    json_object_set_new(
+        root.get(), "provider_url", json_string(provider_url.c_str()));
+    json_object_set_new(
+        root.get(), "selected_url", json_string(selected_url.c_str()));
+    json_object_set_new(
+        root.get(), "selected_name", json_string(selected_name.c_str()));
+    json_object_set_new(root.get(), "measured_at_ms", json_integer(NowMs()));
+
+    for (const StreamRegion& region : regions)
+    {
+        JsonPtr entry(json_object(), &json_decref);
+        json_object_set_new(entry.get(), "name", json_string(region.name.c_str()));
+        json_object_set_new(entry.get(), "url", json_string(region.url.c_str()));
+        json_object_set_new(entry.get(), "ping_ms", json_integer(region.ping_ms));
+        json_object_set_new(entry.get(), "jitter_ms", json_integer(region.jitter_ms));
+        json_object_set_new(
+            entry.get(), "selection_score_ms",
+            json_integer(region.selection_score_ms));
+        json_object_set_new(
+            entry.get(), "successful_probes",
+            json_integer(region.successful_probes));
+        json_object_set_new(
+            entry.get(), "attempted_probes",
+            json_integer(region.attempted_probes));
+        json_array_append_new(entries.get(), json_incref(entry.get()));
+    }
+    json_object_set_new(root.get(), "regions", json_incref(entries.get()));
+
+    char* dump = json_dumps(root.get(), JSON_INDENT(2));
+    if (!dump)
+        throw std::runtime_error("Failed to serialize server region cache");
+    std::unique_ptr<char, decltype(&std::free)> output(dump, &std::free);
+    WriteTextFileAtomically(GetRegionSelectionCachePath(), output.get());
 }
 
 std::string FormatResult(Result rc)
@@ -1261,32 +1505,38 @@ std::vector<std::string> BuildGfnLcarsHeaders(
     return headers;
 }
 
-server_location::LatencyEstimate MeasureRegionLatency(
-    const HttpClient& http_client,
-    const std::string& url)
+std::vector<std::string> BuildMembershipHeaders(const std::string& token)
 {
-    constexpr int kProbeCount = 5;
-    constexpr long kProbeTimeoutMs = 1500;
+    return {
+        "Accept: application/json",
+        "Authorization: GFNJWT " + token,
+        "nv-client-id: " + std::string(kLcarsClientId),
+        "nv-client-type: NATIVE",
+        "nv-client-version: " + std::string(kClientVersion),
+        "nv-client-streamer: NVIDIA-CLASSIC",
+        "nv-device-os: WINDOWS",
+        "nv-device-type: DESKTOP",
+        "nv-device-make: UNKNOWN",
+        "nv-device-model: UNKNOWN",
+    };
+}
 
-    // Warm DNS once, then use fresh TCP connections for every scored probe.
-    (void)http_client.MeasureTcpHandshakeLatencyMs(url, kProbeTimeoutMs);
-
+std::vector<int> MeasureRegionLatencySamples(
+    const HttpClient& http_client,
+    const std::string& url,
+    int probe_count,
+    long timeout_ms)
+{
     std::vector<int> samples;
-    samples.reserve(kProbeCount);
-    for (int attempt = 0; attempt < kProbeCount; ++attempt)
+    samples.reserve(static_cast<size_t>(std::max(0, probe_count)));
+    for (int attempt = 0; attempt < probe_count; ++attempt)
     {
-        if (attempt > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(60));
-
         const int ping_ms =
-            http_client.MeasureTcpHandshakeLatencyMs(url, kProbeTimeoutMs);
+            http_client.MeasureTcpHandshakeLatencyMs(url, timeout_ms);
         if (ping_ms >= 0)
             samples.push_back(ping_ms);
     }
-
-    return server_location::EstimateLatency(
-        std::move(samples),
-        kProbeCount);
+    return samples;
 }
 
 std::vector<std::string> BuildGraphQlHeaders(const std::string& token)
@@ -2156,7 +2406,10 @@ AuthUser FetchUserInfo(NativeAuthHttpSession& session, const AuthTokens& tokens)
     user.display_name = GetString(root.get(), "preferred_username");
     user.email = GetString(root.get(), "email");
     user.avatar_url = GetString(root.get(), "picture");
-    user.membership_tier = "FREE";
+    // NVIDIA's user-info JWT does not carry the GeForce NOW subscription.
+    // The authoritative tier is resolved separately through MES.
+    user.membership_tier.clear();
+    user.membership_tier_verified = false;
     if (user.display_name.empty() && !user.email.empty())
     {
         const auto at = user.email.find('@');
@@ -2533,18 +2786,102 @@ std::string BuildAppMetadataUrl(
 
 std::string ResolveVpcId(const HttpClient& http_client, const AuthSession& session)
 {
+    const std::string token = ResolveSessionJwt(session);
+    if (token.empty())
+        return "NP-AMS-08";
+
+    const StreamSettings settings = LoadStreamSettings();
+    const std::string base_url = server_location::ResolveStreamingBaseUrl(
+        settings.region, session.provider.streaming_service_url);
+    if (base_url.empty())
+        return "NP-AMS-08";
+
+    std::vector<std::string> headers = BuildMembershipHeaders(token);
+    for (std::string& header : headers)
+    {
+        if (header == "nv-client-type: NATIVE")
+            header = "nv-client-type: BROWSER";
+        else if (header == "nv-client-streamer: NVIDIA-CLASSIC")
+            header = "nv-client-streamer: WEBRTC";
+    }
     const HttpResponse response = http_client.Get(
-        EnsureTrailingSlash(session.provider.streaming_service_url) + "v2/serverInfo",
+        EnsureTrailingSlash(base_url) + "v2/serverInfo",
         GfnClient::kUserAgent,
-        BuildGfnLcarsHeaders(ResolveSessionJwt(session), "NATIVE", "NVIDIA-CLASSIC", true));
+        headers);
 
     if (response.status_code != 200)
-        return "GFN-PC";
+        return "NP-AMS-08";
 
-    JsonPtr root = LoadJson(response.body);
-    json_t* request_status = json_object_get(root.get(), "requestStatus");
-    const std::string server_id = GetString(request_status, "serverId");
-    return server_id.empty() ? std::string("GFN-PC") : server_id;
+    try
+    {
+        JsonPtr root = LoadJson(response.body);
+        json_t* request_status = json_object_get(root.get(), "requestStatus");
+        const std::string server_id = GetString(request_status, "serverId");
+        return server_id.empty() ? std::string("NP-AMS-08") : server_id;
+    }
+    catch (...)
+    {
+        return "NP-AMS-08";
+    }
+}
+
+bool RefreshMembershipTier(const HttpClient& http_client, AuthSession& session)
+{
+    session.membership_checked_at_ms = NowMs();
+    const std::string token = ResolveSessionJwt(session);
+    if (token.empty() || session.user.user_id.empty())
+    {
+        AppendAuthLog("auth: membership lookup skipped because identity is incomplete");
+        return false;
+    }
+
+    try
+    {
+        const std::string vpc_id = ResolveVpcId(http_client, session);
+        const std::string url = std::string(kSubscriptionEndpoint) +
+            "?serviceName=gfn_pc&languageCode=en_US&vpcId=" + UrlEncode(vpc_id) +
+            "&userId=" + UrlEncode(session.user.user_id);
+        const HttpResponse response = http_client.Get(
+            url,
+            GfnClient::kUserAgent,
+            BuildMembershipHeaders(token));
+        if (response.status_code != 200)
+        {
+            AppendAuthLog(
+                "auth: membership lookup failed HTTP=" +
+                std::to_string(response.status_code) +
+                " keepingVerified=" +
+                std::to_string(session.user.membership_tier_verified ? 1 : 0));
+            return false;
+        }
+
+        JsonPtr root = LoadJson(response.body);
+        const SubscriptionInfo subscription = ParseSubscription(root.get());
+        const std::string tier = subscription.membership_tier;
+        if (tier.empty())
+        {
+            AppendAuthLog("auth: membership lookup returned no membershipTier");
+            return false;
+        }
+
+        session.subscription = subscription;
+        session.user.membership_tier = tier;
+        session.user.membership_tier_verified = true;
+        AppendAuthLog(
+            "auth: membership tier verified tier=" + tier +
+            " vpc=" + vpc_id +
+            " remainingHours=" + std::to_string(session.subscription.remaining_hours) +
+            " storage=" + std::to_string(session.subscription.storage_size_gb));
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        AppendAuthLog(
+            "auth: membership lookup failed error=" + std::string(e.what()) +
+            " keepingVerified=" +
+            std::to_string(session.user.membership_tier_verified ? 1 : 0));
+        return false;
+    }
 }
 
 std::vector<GameInfo> ParseLibraryGames(JsonPtr& root)

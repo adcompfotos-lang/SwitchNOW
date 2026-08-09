@@ -48,6 +48,11 @@ class GfnClient
     std::vector<StreamRegion> FetchStreamRegions(AuthSession& session) const;
     std::vector<StreamRegion> MeasureStreamRegionLatencies(
         std::vector<StreamRegion> regions) const;
+    std::vector<StreamRegion> LoadCachedStreamRegions(
+        const AuthSession& session) const;
+    void SaveStreamRegionMeasurements(
+        const AuthSession& session,
+        const std::vector<StreamRegion>& regions) const;
 
     AuthSession Login(const LoginProvider& provider, const std::string& login_hint = {}) const;
     AuthSession LoginNative(
@@ -79,7 +84,8 @@ class GfnClient
     SessionInfo ReportSessionAd(
         AuthSession& session,
         const std::string& session_id,
-        const SessionAdReport& report) const;
+        const SessionAdReport& report,
+        const std::string& server_ip = "") const;
     void StopSession(
         AuthSession& session,
         const std::string& session_id,

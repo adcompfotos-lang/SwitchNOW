@@ -6,6 +6,7 @@
 #include <borealis.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -23,6 +24,8 @@ class CatalogTab : public brls::Box
   private:
     void ReloadCatalog(const std::string& server_query = {});
     void BeginSearch();
+    bool ClearSearch();
+    void UpdateSearchUi();
     void RebuildList();
     void LoadMoreOrRefresh();
     void EnsurePagingButton();
@@ -40,6 +43,7 @@ class CatalogTab : public brls::Box
     std::vector<std::vector<brls::View*>> card_rows_;
     std::vector<brls::View*> toolbar_buttons_;
     brls::Label* status_label_                 = nullptr;
+    brls::Label* search_context_label_          = nullptr;
     brls::Button* search_button_               = nullptr;
     brls::Button* filter_button_               = nullptr;
     brls::Button* sort_button_                 = nullptr;
@@ -56,6 +60,7 @@ class CatalogTab : public brls::Box
     bool paging_button_attached_               = false;
     std::shared_ptr<std::atomic_bool> alive_   = std::make_shared<std::atomic_bool>(true);
     std::string search_query_                  = "";
+    std::uint64_t search_generation_           = 0;
     size_t filtered_count_                     = 0;
     size_t page_index_                         = 0;
     size_t store_filter_index_                 = 0;

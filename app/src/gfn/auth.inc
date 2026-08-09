@@ -284,6 +284,7 @@ AuthSession GfnClient::LoginNative(
             auth_session.tokens = std::move(tokens);
             auth_session.user = FetchUserInfo(native_http, auth_session.tokens);
             auth_session.last_refresh_at_ms = NowMs();
+            RefreshMembershipTier(http_client_, auth_session);
             AppendAuthLog("auth-native: login complete");
             return auth_session;
         }
@@ -667,6 +668,7 @@ AuthSession GfnClient::LoginSwitchQR(const LoginProvider& provider, std::functio
     session.tokens   = tokens;
     session.user     = FetchUserInfo(token_http, tokens);
     session.last_refresh_at_ms = NowMs();
+    RefreshMembershipTier(http_client_, session);
     AppendAuthLog("auth: user info ok user_id_present=" + std::string(session.user.user_id.empty() ? "no" : "yes"));
     return session;
 }
@@ -676,8 +678,15 @@ AuthSession GfnClient::EnsureFreshSession(const AuthSession& session) const
     const bool access_needs_refresh = IsNearExpiry(session.tokens.expires_at_ms);
     const bool client_needs_refresh = session.tokens.client_token.empty() ||
         IsNearExpiry(session.tokens.client_token_expires_at_ms);
+    const std::int64_t membership_interval = session.user.membership_tier_verified
+        ? kMembershipRefreshIntervalMs
+        : kMembershipRetryIntervalMs;
+    const bool membership_needs_refresh =
+        !session.subscription.available ||
+        session.membership_checked_at_ms <= 0 ||
+        NowMs() - session.membership_checked_at_ms >= membership_interval;
 
-    if (!access_needs_refresh && !client_needs_refresh)
+    if (!access_needs_refresh && !client_needs_refresh && !membership_needs_refresh)
         return session;
 
     AuthSession refreshed = session;
@@ -705,6 +714,8 @@ AuthSession GfnClient::EnsureFreshSession(const AuthSession& session) const
     {
         RequestClientTokenNative(refreshed.tokens);
     }
+    if (membership_needs_refresh || access_needs_refresh)
+        RefreshMembershipTier(http_client_, refreshed);
     return refreshed;
 }
 
@@ -733,6 +744,9 @@ AuthSession GfnClient::EnsureFreshSavedSession(const AuthSession& session) const
         refreshed.tokens.client_token != source.tokens.client_token ||
         refreshed.tokens.expires_at_ms != source.tokens.expires_at_ms ||
         refreshed.tokens.client_token_expires_at_ms != source.tokens.client_token_expires_at_ms ||
+        refreshed.user.membership_tier != source.user.membership_tier ||
+        refreshed.user.membership_tier_verified != source.user.membership_tier_verified ||
+        refreshed.membership_checked_at_ms != source.membership_checked_at_ms ||
         refreshed.last_refresh_at_ms != source.last_refresh_at_ms;
     if (changed)
         SaveSession(refreshed);
@@ -751,6 +765,7 @@ AuthSession GfnClient::ForceRefreshSavedSession(const AuthSession& session) cons
             RequestClientTokenNative(refreshed.tokens);
         }
         refreshed.last_refresh_at_ms = NowMs();
+        RefreshMembershipTier(http_client_, refreshed);
         return refreshed;
     }
 
@@ -776,6 +791,7 @@ AuthSession GfnClient::ForceRefreshSavedSession(const AuthSession& session) cons
         RequestClientTokenNative(refreshed.tokens);
     }
     refreshed.last_refresh_at_ms = NowMs();
+    RefreshMembershipTier(http_client_, refreshed);
     SaveSession(refreshed);
     return refreshed;
 }
@@ -815,12 +831,44 @@ bool ParseSessionObject(json_t* root, AuthSession& session)
     session.user.email           = GetString(user, "email");
     session.user.avatar_url      = GetString(user, "avatar_url");
     session.user.membership_tier = GetString(user, "membership_tier");
-    if (session.user.membership_tier.empty())
-        session.user.membership_tier = "FREE";
+    session.user.membership_tier_verified =
+        GetBool(user, "membership_tier_verified", false);
+
+    json_t* subscription = json_object_get(root, "subscription");
+    if (json_is_object(subscription))
+    {
+        session.subscription.membership_tier = GetString(subscription, "membership_tier");
+        session.subscription.subscription_type = GetString(subscription, "subscription_type");
+        session.subscription.subscription_subtype = GetString(subscription, "subscription_subtype");
+        session.subscription.allotted_hours = JsonNumber(subscription, "allotted_hours");
+        session.subscription.purchased_hours = JsonNumber(subscription, "purchased_hours");
+        session.subscription.rolled_over_hours = JsonNumber(subscription, "rolled_over_hours");
+        session.subscription.used_hours = JsonNumber(subscription, "used_hours");
+        session.subscription.remaining_hours = JsonNumber(subscription, "remaining_hours");
+        session.subscription.total_hours = JsonNumber(subscription, "total_hours");
+        session.subscription.is_unlimited = GetBool(subscription, "is_unlimited", false);
+        session.subscription.available = GetBool(subscription, "available", false);
+        session.subscription.has_storage = GetBool(subscription, "has_storage", false);
+        session.subscription.has_storage_usage =
+            GetBool(subscription, "has_storage_usage", false);
+        session.subscription.storage_size_gb = JsonNumber(subscription, "storage_size_gb");
+        session.subscription.storage_used_gb = JsonNumber(subscription, "storage_used_gb");
+        session.subscription.storage_region_name =
+            GetString(subscription, "storage_region_name");
+        session.subscription.storage_region_code =
+            GetString(subscription, "storage_region_code");
+    }
 
     json_t* last_refresh = json_object_get(root, "last_refresh_at_ms");
     if (json_is_integer(last_refresh))
         session.last_refresh_at_ms = static_cast<std::int64_t>(json_integer_value(last_refresh));
+
+    json_t* membership_checked = json_object_get(root, "membership_checked_at_ms");
+    if (json_is_integer(membership_checked))
+    {
+        session.membership_checked_at_ms =
+            static_cast<std::int64_t>(json_integer_value(membership_checked));
+    }
 
     if (session.provider.idp_id.empty())
         session.provider = DefaultProvider();
@@ -834,6 +882,7 @@ JsonPtr BuildSessionObject(const AuthSession& session)
     JsonPtr provider(json_object(), &json_decref);
     JsonPtr tokens(json_object(), &json_decref);
     JsonPtr user(json_object(), &json_decref);
+    JsonPtr subscription(json_object(), &json_decref);
 
     json_object_set_new(provider.get(), "idp_id", json_string(session.provider.idp_id.c_str()));
     json_object_set_new(provider.get(), "code", json_string(session.provider.code.c_str()));
@@ -859,11 +908,48 @@ JsonPtr BuildSessionObject(const AuthSession& session)
     json_object_set_new(user.get(), "email", json_string(session.user.email.c_str()));
     json_object_set_new(user.get(), "avatar_url", json_string(session.user.avatar_url.c_str()));
     json_object_set_new(user.get(), "membership_tier", json_string(session.user.membership_tier.c_str()));
+    json_object_set_new(
+        user.get(), "membership_tier_verified",
+        json_boolean(session.user.membership_tier_verified));
+
+    json_object_set_new(
+        subscription.get(), "membership_tier",
+        json_string(session.subscription.membership_tier.c_str()));
+    json_object_set_new(
+        subscription.get(), "subscription_type",
+        json_string(session.subscription.subscription_type.c_str()));
+    json_object_set_new(
+        subscription.get(), "subscription_subtype",
+        json_string(session.subscription.subscription_subtype.c_str()));
+    json_object_set_new(subscription.get(), "allotted_hours", json_real(session.subscription.allotted_hours));
+    json_object_set_new(subscription.get(), "purchased_hours", json_real(session.subscription.purchased_hours));
+    json_object_set_new(subscription.get(), "rolled_over_hours", json_real(session.subscription.rolled_over_hours));
+    json_object_set_new(subscription.get(), "used_hours", json_real(session.subscription.used_hours));
+    json_object_set_new(subscription.get(), "remaining_hours", json_real(session.subscription.remaining_hours));
+    json_object_set_new(subscription.get(), "total_hours", json_real(session.subscription.total_hours));
+    json_object_set_new(subscription.get(), "is_unlimited", json_boolean(session.subscription.is_unlimited));
+    json_object_set_new(subscription.get(), "available", json_boolean(session.subscription.available));
+    json_object_set_new(subscription.get(), "has_storage", json_boolean(session.subscription.has_storage));
+    json_object_set_new(
+        subscription.get(), "has_storage_usage",
+        json_boolean(session.subscription.has_storage_usage));
+    json_object_set_new(subscription.get(), "storage_size_gb", json_real(session.subscription.storage_size_gb));
+    json_object_set_new(subscription.get(), "storage_used_gb", json_real(session.subscription.storage_used_gb));
+    json_object_set_new(
+        subscription.get(), "storage_region_name",
+        json_string(session.subscription.storage_region_name.c_str()));
+    json_object_set_new(
+        subscription.get(), "storage_region_code",
+        json_string(session.subscription.storage_region_code.c_str()));
 
     json_object_set_new(root.get(), "provider", json_incref(provider.get()));
     json_object_set_new(root.get(), "tokens", json_incref(tokens.get()));
     json_object_set_new(root.get(), "user", json_incref(user.get()));
+    json_object_set_new(root.get(), "subscription", json_incref(subscription.get()));
     json_object_set_new(root.get(), "last_refresh_at_ms", json_integer(session.last_refresh_at_ms));
+    json_object_set_new(
+        root.get(), "membership_checked_at_ms",
+        json_integer(session.membership_checked_at_ms));
     return root;
 }
 

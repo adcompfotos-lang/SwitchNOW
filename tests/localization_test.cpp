@@ -44,6 +44,34 @@ int main()
                "Manage your GeForce NOW identity and persistent sign-in.");
         assert(opennow::Tr("NTE Auto-login: Ready") != "NTE Auto-login: Ready");
         assert(opennow::Tr("library title") != "library title");
+        assert(opennow::Tr("All") != "All");
+        assert(opennow::Tr("Clear search") != "Clear search");
+        assert(opennow::Tr("Search Library") != "Search Library");
+        assert(opennow::Tr("Search Catalog") != "Search Catalog");
+        assert(opennow::Tr("QUEUE") != "QUEUE");
+        assert(opennow::Tr("SETUP") != "SETUP");
+        assert(opennow::Tr("READY") != "READY");
+        assert(opennow::Tr("Advertisement required") !=
+               "Advertisement required");
+        assert(opennow::Tr(
+                   "Waiting for NVIDIA to provide the Free-tier advertisement details.") !=
+               "Waiting for NVIDIA to provide the Free-tier advertisement details.");
+        assert(opennow::Tr("Free-tier advertisement ready") !=
+               "Free-tier advertisement ready");
+        assert(opennow::Tr("Connecting to the streaming server") !=
+               "Connecting to the streaming server");
+        assert(opennow::Tr("Starting the video stream") !=
+               "Starting the video stream");
+        assert(opennow::TrFormat("Setting up rig... Position: {0}", {"12"}).find("12") !=
+               std::string::npos);
+        assert(opennow::Tr("Updates") != "Updates");
+        assert(opennow::Tr("Check for updates") != "Check for updates");
+        assert(opennow::Tr("SwitchNOW is up to date") != "SwitchNOW is up to date");
+        assert(opennow::Tr("You already have the latest version ({0}).") !=
+               "You already have the latest version ({0}).");
+        assert(opennow::Tr("HOME shortcut created") != "HOME shortcut created");
+        assert(opennow::TrFormat("Searching for: {0}", {"Fortnite"}).find("Fortnite") !=
+               std::string::npos);
         assert(opennow::TrFormat("Position in queue:{0}", {"17"}).find("17") !=
                std::string::npos);
         assert(opennow::TrFormat("Loaded {0} supported games.", {"360"}).find("360") !=

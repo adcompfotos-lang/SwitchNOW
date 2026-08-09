@@ -1,6 +1,8 @@
 #include "StreamView.hpp"
+#include "membership_tier_policy.hpp"
 #include "controller_layout.hpp"
 #include "input/TouchMapping.hpp"
+#include "localization.hpp"
 #include "network_utils.hpp"
 #include "nte_autologin_log.hpp"
 #include "runtime_journal.hpp"
@@ -38,14 +40,6 @@ int16_t QuantizeAxis(float value)
 {
     value = std::max(-1.0f, std::min(1.0f, value));
     return static_cast<int16_t>(std::lround(value * 32767.0f));
-}
-
-bool IsFreeTier(std::string tier)
-{
-    std::transform(tier.begin(), tier.end(), tier.begin(), [](unsigned char value) {
-        return static_cast<char>(std::toupper(value));
-    });
-    return tier == "FREE";
 }
 
 struct KeyboardStroke {
@@ -147,7 +141,9 @@ StreamView::StreamView(
     debug_diagnostics_ = stream_settings.debug_diagnostics;
     controller_layout_ = stream_settings.controller_layout;
     opennow::SetStreamDiagnosticsEnabled(debug_diagnostics_);
-    free_tier_session_ = IsFreeTier(auth_.user.membership_tier);
+    free_tier_session_ = opennow::membership::IsVerifiedFreeTier(
+        auth_.user.membership_tier,
+        auth_.user.membership_tier_verified);
     stream_started_at_ = std::chrono::steady_clock::now();
     is_nte_session_ = opennow::IsNevernessToEverness(game_title_);
     if (is_nte_session_) {
@@ -856,7 +852,8 @@ void StreamView::DrawPreparingStream(
         nvgText(vg, cx, rail_y, number.c_str(), nullptr);
         nvgFontSize(vg, 12.0f);
         nvgFillColor(vg, complete || active ? nvgRGB(225, 232, 229) : nvgRGB(91, 96, 105));
-        nvgText(vg, cx, rail_y + 42.0f, kSteps[i], nullptr);
+        const std::string step_label = opennow::Tr(kSteps[i]);
+        nvgText(vg, cx, rail_y + 42.0f, step_label.c_str(), nullptr);
     }
 
     const float spinner_x = panel_x + panel_width * 0.5f;

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.1.7",
+    [string]$Version = "1.2.0",
     [string]$BuildDirectory = "switch",
     [string]$Flavor = ""
 )
@@ -41,6 +41,10 @@ New-Item -ItemType Directory -Force -Path $switchDir | Out-Null
 
 Copy-Item -LiteralPath $nro -Destination (Join-Path $switchDir "SwitchNOW.nro") -Force
 Copy-Item -LiteralPath $nro -Destination $versionedNro -Force
+$nroHash = (Get-FileHash -LiteralPath $versionedNro -Algorithm SHA256).Hash.ToLowerInvariant()
+Set-Content -LiteralPath (Join-Path $dist "SHA256SUMS.txt") `
+    -Value "$nroHash  $([System.IO.Path]::GetFileName($versionedNro))" `
+    -Encoding ASCII
 Copy-Item -LiteralPath (Join-Path $repo "resources\icon\icon.jpg") -Destination (Join-Path $switchDir "icon.jpg") -Force
 Copy-Item -LiteralPath (Join-Path $repo "resources\icon\icon.png") -Destination (Join-Path $switchDir "icon.png") -Force
 Copy-Item -LiteralPath (Join-Path $repo "README.md") -Destination (Join-Path $packageRoot "README.md") -Force

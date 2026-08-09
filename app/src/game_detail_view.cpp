@@ -3,6 +3,7 @@
 #include "app_state.hpp"
 #include "cover_image_cache.hpp"
 #include "description_scroll_policy.hpp"
+#include "home_shortcut.hpp"
 #include "nte_credentials.hpp"
 #include "ui_helpers.hpp"
 #include "localization.hpp"
@@ -357,16 +358,34 @@ GameDetailView::GameDetailView(const GfnClient& client, GameDetailData data)
     });
     actions->addView(play_button);
 
+    auto* secondary_actions = new brls::Box(brls::Axis::ROW);
+    secondary_actions->setHeight(44);
+    secondary_actions->setMarginTop(8);
+
     store_button_ = new brls::Button();
     store_button_->setHeight(44);
     store_button_->setCornerRadius(8);
-    store_button_->setMarginTop(8);
+    store_button_->setGrow(1.0f);
     store_button_->registerClickAction([this](brls::View*) {
         ShowStoreSelector(false);
         return true;
     });
     UpdateStoreButton();
-    actions->addView(store_button_);
+    secondary_actions->addView(store_button_);
+
+    auto* shortcut_button = new brls::Button();
+    shortcut_button->setStyle(&brls::BUTTONSTYLE_BORDERED);
+    shortcut_button->setWidth(52);
+    shortcut_button->setHeight(44);
+    shortcut_button->setCornerRadius(8);
+    shortcut_button->setMarginLeft(8);
+    shortcut_button->setText("+");
+    shortcut_button->registerClickAction([this](brls::View*) {
+        CreateSwitchShortcut();
+        return true;
+    });
+    secondary_actions->addView(shortcut_button);
+    actions->addView(secondary_actions);
 
     const std::string studio = !data_.developer.empty()
         ? data_.developer
@@ -512,6 +531,12 @@ GameDetailView::GameDetailView(const GfnClient& client, GameDetailData data)
         brls::Application::popActivity();
         return true;
     });
+}
+
+GameDetailView::~GameDetailView()
+{
+    alive_->store(false);
+    screenshot_generation_->fetch_add(1);
 }
 
 void GameDetailView::ShowPreviousScreenshot()
@@ -715,6 +740,81 @@ void GameDetailView::LaunchSelectedVariant()
     LaunchSessionDialog(client_, *AppState::Instance().session(), launch_app_id,
                         data_.title, store, data_.title, data_.game_id,
                         data_.image_url);
+}
+
+void GameDetailView::CreateSwitchShortcut()
+{
+    shortcut::LaunchRequest request;
+    request.launch_app_id = data_.launch_app_id;
+    request.store = data_.stores;
+    if (selected_variant_index_ < data_.variants.size())
+    {
+        request.launch_app_id = data_.variants[selected_variant_index_].id;
+        request.store = data_.variants[selected_variant_index_].store;
+    }
+    request.game_id = data_.game_id;
+    request.title = data_.title;
+    request.image_url = data_.image_url;
+    if (!shortcut::IsValid(request))
+    {
+        ShowError(
+            Tr("Shortcut unavailable"),
+            Tr("This game does not expose a valid GeForce NOW launch ID."));
+        return;
+    }
+
+    auto* confirmation = new brls::Dialog(
+        Tr("Create a personalized shortcut for this game?\n\n"
+           "The shortcut uses the selected store and game artwork. It can "
+           "start the game directly through your saved SwitchNOW account.\n\n"
+           "Installing it on the Horizon HOME screen is offered separately."));
+    confirmation->addButton(
+        Tr("Create shortcut"),
+        [request = std::move(request), alive = alive_]() mutable {
+            brls::Application::notify(Tr("Creating game shortcut..."));
+            brls::async([request = std::move(request), alive]() mutable {
+                shortcut::CreateResult result =
+                    shortcut::CreateGameShortcut(std::move(request));
+                brls::sync([result = std::move(result), alive]() {
+                    if (!alive->load())
+                        return;
+                    if (!result.success)
+                    {
+                        ShowError(Tr("Shortcut creation failed"), result.error);
+                        return;
+                    }
+
+                    std::string body = Tr(
+                        "The game shortcut is ready in the SwitchNOW Shortcuts "
+                        "folder.\n\nInstall it to SD storage now so it appears "
+                        "directly on the Horizon HOME screen?");
+                    if (!result.used_game_cover)
+                    {
+                        body += "\n\n" + Tr(
+                            "SwitchNOW artwork was used because the game cover "
+                            "could not be converted safely.");
+                    }
+
+                    auto* install = new brls::Dialog(body);
+                    install->addButton(
+                        Tr("Install on HOME"),
+                        [path = result.nro_path, title = result.title] {
+                            std::string error;
+                            if (!shortcut::StartForwarderInstaller(
+                                    path, title, error))
+                            {
+                                ShowError(Tr("HOME installation failed"), error);
+                            }
+                        });
+                    install->addButton(Tr("Keep for hbmenu"), [] {});
+                    install->setCancelable(true);
+                    install->open();
+                });
+            }, false);
+        });
+    confirmation->addButton(Tr("Cancel"), [] {});
+    confirmation->setCancelable(true);
+    confirmation->open();
 }
 
 GameDetailData MakeLibraryGameDetail(const GameInfo& game)

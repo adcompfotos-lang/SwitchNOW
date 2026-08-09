@@ -2,16 +2,20 @@
 
 #include "app_state.hpp"
 #include "gfn_client.hpp"
+#include "home_shortcut_policy.hpp"
 #include "main_tabs_view.hpp"
 #include "localization.hpp"
 #include "runtime_journal.hpp"
+#include "ui_helpers.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 
 namespace opennow
 {
@@ -71,8 +75,10 @@ class StartupPulseView final : public brls::View
 class StartupGateView final : public brls::Box
 {
   public:
-    StartupGateView()
+    explicit StartupGateView(
+        std::optional<shortcut::LaunchRequest> launch_request)
         : brls::Box(brls::Axis::COLUMN)
+        , launch_request_(std::move(launch_request))
     {
         setGrow(1.0f);
         setAlignItems(brls::AlignItems::CENTER);
@@ -262,24 +268,66 @@ class StartupGateView final : public brls::Box
         setJustifyContent(brls::JustifyContent::FLEX_START);
         setPadding(0);
         auto* tabs = new MainTabsView();
-        tabs->setWidth(brls::Application::windowWidth);
-        tabs->setHeight(brls::Application::windowHeight);
+        // Borealis lays activities out in a logical 1280x720 coordinate space.
+        // windowWidth/windowHeight are the physical framebuffer dimensions and
+        // become 1920x1080 while docked. Applying them here scales the tab tree
+        // twice, allowing cards and scroll targets to extend beyond the TV.
+        // Flex sizing keeps the same visible bounds across dock/undock changes.
         tabs->setGrow(1.0f);
         addView(tabs);
         invalidate();
         brls::Application::giveFocus(tabs);
+        const auto alive = alive_;
+        brls::sync([this, alive] {
+            if (alive->load())
+                MaybeLaunchShortcut();
+        });
+    }
+
+    void MaybeLaunchShortcut()
+    {
+        if (!launch_request_)
+            return;
+
+        const shortcut::LaunchRequest request = std::move(*launch_request_);
+        launch_request_.reset();
+        const auto& session = AppState::Instance().session();
+        if (!session)
+        {
+            ShowError(
+                Tr("Shortcut needs sign-in"),
+                Tr("Connect a GeForce NOW account in SwitchNOW, then open the game shortcut again."));
+            return;
+        }
+        if (session->reauthentication_required)
+        {
+            ShowError(
+                Tr("Shortcut needs sign-in"),
+                Tr("Reconnect the saved GeForce NOW account, then open the game shortcut again."));
+            return;
+        }
+
+        LogRuntimeEvent(
+            "shortcut", "direct_launch",
+            "title=" + request.title + " launch_app_id=" + request.launch_app_id);
+        GfnClient client;
+        LaunchSessionDialog(
+            client, *session, request.launch_app_id, request.title,
+            request.store, request.title, request.game_id, request.image_url);
     }
 
     brls::Label* status_label_ = nullptr;
     brls::Label* detail_label_ = nullptr;
     std::shared_ptr<std::atomic_bool> alive_ = std::make_shared<std::atomic_bool>(true);
+    std::optional<shortcut::LaunchRequest> launch_request_;
     bool finished_ = false;
 };
 
 } // namespace
 
-MainActivity::MainActivity()
-    : brls::Activity(new StartupGateView())
+MainActivity::MainActivity(
+    std::optional<shortcut::LaunchRequest> launch_request)
+    : brls::Activity(new StartupGateView(std::move(launch_request)))
 {
 }
 

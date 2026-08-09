@@ -438,6 +438,8 @@ std::string SessionInfoTraceSummary(const SessionInfo& info)
         << " queuePosition=" << info.queue_position
         << " appPatching=" << (info.app_patching ? 1 : 0)
         << " serverIp=" << info.server_ip
+        << " requestedRegion=" << info.requested_region_url
+        << " assignedServerId=" << info.assigned_server_id
         << " signalingUrl=" << info.signaling_url
         << " media=" << info.media_ip << ":" << info.media_port
         << " iceServers=" << info.ice_servers.size()
