@@ -21,7 +21,13 @@ jobs:
           apt-get install -y --no-install-recommends python3-jinja2 python3-jsonschema
 
       - name: Build NRO
-        run: bash scripts/build-switch-msys2.sh
+        run: |
+          export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+          export DEVKITA64="${DEVKITA64:-$DEVKITPRO/devkitA64}"
+          export PATH="$DEVKITPRO/tools/bin:$DEVKITA64/bin:$DEVKITPRO/portlibs/switch/bin:$PATH"
+          cmake -B build/switch -G Ninja
+          cmake --build build/switch --target cjson mbedtls srtp2 usrsctp -j4
+          cmake --build build/switch --target SwitchNOW.nro -j4
 
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
