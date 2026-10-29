@@ -1,3 +1,10 @@
+// Since 27/10/2026 CloudMatch hands native identities a classic RTSP rig
+// that never sends a WebRTC offer; identify as the web client instead.
+static constexpr const char* kCloudMatchClientVersion = "2.0.89.154";
+static constexpr const char* kCloudMatchUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+
 SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& launch_app_id,
                                     const std::string& launch_store,
                                     const std::string& internal_title,
@@ -143,9 +150,9 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
         "Content-Type: application/json",
         "nv-client-id: " + client_id_,
         "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
+        "nv-client-streamer: WEBRTC",
+        "nv-client-type: BROWSER",
+        "nv-client-version: " + std::string(kCloudMatchClientVersion),
         "nv-device-make: UNKNOWN",
         "nv-device-model: UNKNOWN",
         "nv-device-os: WINDOWS",
@@ -178,14 +185,14 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
     AppendSessionTraceLog("START headers:\n" + HeadersForTrace(headers));
     AppendSessionTraceLog("START request body:\n" + JsonForTrace(body));
 
-    HttpResponse response = http_client_.Post(url, kUserAgent, headers, body);
+    HttpResponse response = http_client_.Post(url, kCloudMatchUserAgent, headers, body);
     if (response.status_code == 401)
     {
         session = ForceRefreshSavedSession(session);
         jwt_token = ResolveSessionJwt(session);
         headers[0] = "Authorization: GFNJWT " + jwt_token;
         AppendSessionTraceLog("START authorization rejected; refreshed token and retrying once");
-        response = http_client_.Post(url, kUserAgent, headers, body);
+        response = http_client_.Post(url, kCloudMatchUserAgent, headers, body);
     }
     AppendSessionTraceLog("START response HTTP " + std::to_string(response.status_code));
     AppendSessionTraceLog("START response body:\n" + JsonForTrace(response.body));
@@ -208,7 +215,7 @@ SessionInfo GfnClient::StartSession(AuthSession& session, const std::string& lau
         CleanupStaleCloudSession(session);
         jwt_token = ResolveSessionJwt(session);
         headers[0] = "Authorization: GFNJWT " + jwt_token;
-        response = http_client_.Post(url, kUserAgent, headers, body);
+        response = http_client_.Post(url, kCloudMatchUserAgent, headers, body);
         AppendSessionTraceLog("START retry response HTTP " + std::to_string(response.status_code));
         AppendSessionTraceLog("START retry response body:\n" + JsonForTrace(response.body));
         root = parse_start_response();
@@ -306,9 +313,9 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
         "Authorization: GFNJWT " + jwt_token,
         "nv-client-id: " + client_id_,
         "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
+        "nv-client-streamer: WEBRTC",
+        "nv-client-type: BROWSER",
+        "nv-client-version: " + std::string(kCloudMatchClientVersion),
         "nv-device-make: UNKNOWN",
         "nv-device-model: UNKNOWN",
         "nv-device-os: WINDOWS",
@@ -319,14 +326,14 @@ SessionInfo GfnClient::PollSession(AuthSession& session, const std::string& sess
 
     AppendSessionTraceLog("POLL url=" + url);
     AppendSessionTraceLog("POLL headers:\n" + HeadersForTrace(headers));
-    HttpResponse response = http_client_.Get(url, kUserAgent, headers);
+    HttpResponse response = http_client_.Get(url, kCloudMatchUserAgent, headers);
     if (response.status_code == 401)
     {
         session = ForceRefreshSavedSession(session);
         jwt_token = ResolveSessionJwt(session);
         headers[0] = "Authorization: GFNJWT " + jwt_token;
         AppendSessionTraceLog("POLL authorization rejected; refreshed token and retrying once");
-        response = http_client_.Get(url, kUserAgent, headers);
+        response = http_client_.Get(url, kCloudMatchUserAgent, headers);
     }
     AppendSessionTraceLog("POLL response HTTP " + std::to_string(response.status_code));
     AppendSessionTraceLog("POLL response body:\n" + JsonForTrace(response.body));
@@ -504,9 +511,9 @@ SessionInfo GfnClient::ReportSessionAd(
         "Authorization: GFNJWT " + jwt_token,
         "nv-client-id: " + client_id_,
         "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
+        "nv-client-streamer: WEBRTC",
+        "nv-client-type: BROWSER",
+        "nv-client-version: " + std::string(kCloudMatchClientVersion),
         "nv-device-make: UNKNOWN",
         "nv-device-model: UNKNOWN",
         "nv-device-os: WINDOWS",
@@ -553,14 +560,14 @@ SessionInfo GfnClient::ReportSessionAd(
         " endpoint=" + endpoint_source +
         " host=" + base_url);
     HttpResponse response = http_client_.Request(
-        "PUT", url, kUserAgent, headers, body);
+        "PUT", url, kCloudMatchUserAgent, headers, body);
     if (response.status_code == 401)
     {
         session = ForceRefreshSavedSession(session);
         jwt_token = ResolveSessionJwt(session);
         headers[0] = "Authorization: GFNJWT " + jwt_token;
         response = http_client_.Request(
-            "PUT", url, kUserAgent, headers, body);
+            "PUT", url, kCloudMatchUserAgent, headers, body);
     }
 
     JsonPtr root(nullptr, &json_decref);
@@ -637,9 +644,9 @@ void GfnClient::StopSession(
         "Authorization: GFNJWT " + jwt_token,
         "nv-client-id: " + client_id_,
         "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
+        "nv-client-streamer: WEBRTC",
+        "nv-client-type: BROWSER",
+        "nv-client-version: " + std::string(kCloudMatchClientVersion),
         "nv-device-make: UNKNOWN",
         "nv-device-model: UNKNOWN",
         "nv-device-os: WINDOWS",
@@ -650,14 +657,14 @@ void GfnClient::StopSession(
 
     AppendSessionTraceLog("STOP url=" + url);
     AppendSessionTraceLog("STOP headers:\n" + HeadersForTrace(headers));
-    HttpResponse response = http_client_.Request("DELETE", url, kUserAgent, headers);
+    HttpResponse response = http_client_.Request("DELETE", url, kCloudMatchUserAgent, headers);
     if (response.status_code == 401)
     {
         session = ForceRefreshSavedSession(session);
         jwt_token = ResolveSessionJwt(session);
         headers[0] = "Authorization: GFNJWT " + jwt_token;
         AppendSessionTraceLog("STOP authorization rejected; refreshed token and retrying once");
-        response = http_client_.Request("DELETE", url, kUserAgent, headers);
+        response = http_client_.Request("DELETE", url, kCloudMatchUserAgent, headers);
     }
     AppendSessionTraceLog("STOP response HTTP " + std::to_string(response.status_code));
     AppendSessionTraceLog("STOP response body:\n" + JsonForTrace(response.body));
@@ -680,9 +687,9 @@ void GfnClient::CleanupStaleCloudSession(AuthSession& session) const
         "Authorization: GFNJWT " + jwt_token,
         "nv-client-id: " + client_id_,
         "nv-browser-type: CHROME",
-        "nv-client-streamer: NVIDIA-CLASSIC",
-        "nv-client-type: NATIVE",
-        "nv-client-version: 30.0",
+        "nv-client-streamer: WEBRTC",
+        "nv-client-type: BROWSER",
+        "nv-client-version: " + std::string(kCloudMatchClientVersion),
         "nv-device-make: UNKNOWN",
         "nv-device-model: UNKNOWN",
         "nv-device-os: WINDOWS",
@@ -692,7 +699,7 @@ void GfnClient::CleanupStaleCloudSession(AuthSession& session) const
     };
 
     AppendSessionTraceLog("CLEANUP list url=" + list_url);
-    HttpResponse response = http_client_.Get(list_url, kUserAgent, headers);
+    HttpResponse response = http_client_.Get(list_url, kCloudMatchUserAgent, headers);
     if (response.status_code == 401)
     {
         session = ForceRefreshSavedSession(session);
@@ -700,7 +707,7 @@ void GfnClient::CleanupStaleCloudSession(AuthSession& session) const
         headers[0] = "Authorization: GFNJWT " + jwt_token;
         AppendSessionTraceLog(
             "CLEANUP authorization rejected; refreshed token and retrying session list once");
-        response = http_client_.Get(list_url, kUserAgent, headers);
+        response = http_client_.Get(list_url, kCloudMatchUserAgent, headers);
     }
     AppendSessionTraceLog("CLEANUP list response HTTP " + std::to_string(response.status_code));
     AppendSessionTraceLog("CLEANUP list response body:\n" + JsonForTrace(response.body));
