@@ -1,0 +1,31 @@
+name: Build SwitchNOW (browser identity fix)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Switch NRO
+    runs-on: ubuntu-24.04
+    container: devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install generator dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends python3-jinja2 python3-jsonschema
+
+      - name: Build NRO
+        run: bash scripts/build-switch-msys2.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: SwitchNOW-1.2.0-fix-${{ github.sha }}
+          path: build/switch/SwitchNOW.nro
+          if-no-files-found: error
