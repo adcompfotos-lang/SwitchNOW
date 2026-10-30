@@ -37,7 +37,8 @@ inline void CycleFrameRate(StreamSettings& value)
 
 inline void CycleBitrate(StreamSettings& value)
 {
-    constexpr std::array<int, 5> bitrates {8000, 12000, 16000, 20000, 25000};
+    constexpr std::array<int, 10> bitrates {8000, 12000, 16000, 20000, 25000,
+                                             30000, 40000, 50000, 60000, 75000};
     int next = bitrates.front();
     for (int bitrate : bitrates)
     {
