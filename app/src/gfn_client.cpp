@@ -70,6 +70,12 @@ constexpr const char* kAuthorizeEndpoint   = "https://login.nvidia.com/authorize
 constexpr const char* kGraphQlEndpoint     = "https://games.geforce.com/graphql";
 
 constexpr const char* kClientId          = "ZU7sPN-miLujMD95LfOQ453IB0AtjM8sMyvgJ9wCXEQ";
+// Client used by OpenNOW's QR (device) login. Sessions it created share this
+// app's auth store and can only be refreshed with the same client and headers.
+constexpr const char* kDeviceClientId    = "q61ddeJrVt7O90Nl-P-N7I36yctih4Ml6FyXLrb6j-U";
+constexpr const char* kDeviceUserAgent   =
+    "Mozilla/5.0 (X11; Linux x86_64; Steam Deck) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 constexpr const char* kClientVersion     = "2.0.80.173";
 constexpr const char* kLcarsClientId     = "ec7e38d4-03af-4b58-b131-cfb0495903ab";
 constexpr const char* kScopes            = "openid consent email tk_client age";
@@ -1595,6 +1601,33 @@ struct NativeAuthResponse
     std::string location;
 };
 
+std::string AuthClientIdFor(const AuthTokens& tokens)
+{
+    return tokens.auth_client_id.empty() ? std::string(kClientId) : tokens.auth_client_id;
+}
+
+std::vector<std::string> BuildAuthHeadersForTokens(
+    const AuthTokens& tokens,
+    const std::string& bearer_token,
+    const std::string& content_type,
+    const std::string& accept = "application/json, text/plain, */*")
+{
+    if (AuthClientIdFor(tokens) != kDeviceClientId)
+        return BuildNvidiaAuthHeaders(bearer_token, content_type, false, accept);
+
+    std::vector<std::string> headers = {
+        "Origin: https://play.geforcenow.com",
+        "Referer: https://play.geforcenow.com/",
+        "Accept: " + accept,
+        "User-Agent: " + std::string(kDeviceUserAgent),
+    };
+    if (!bearer_token.empty())
+        headers.push_back("Authorization: Bearer " + bearer_token);
+    if (!content_type.empty())
+        headers.push_back("Content-Type: " + content_type);
+    return headers;
+}
+
 class NativeAuthHttpSession
 {
   public:
@@ -2199,6 +2232,7 @@ void RequestClientToken(NativeAuthHttpSession& session, AuthTokens& tokens);
 
 AuthTokens MergeRefreshedTokens(AuthTokens tokens, const AuthSession& auth_session)
 {
+    tokens.auth_client_id = auth_session.tokens.auth_client_id;
     if (tokens.refresh_token.empty())
         tokens.refresh_token = auth_session.tokens.refresh_token;
     if (tokens.id_token.empty())
@@ -2219,6 +2253,7 @@ AuthTokens MergeRefreshedTokens(AuthTokens tokens, const AuthSession& auth_sessi
 
 NativeAuthResponse PostTokenGrant(
     NativeAuthHttpSession& session,
+    const AuthTokens& tokens,
     const std::string& body,
     const std::string& grant_name)
 {
@@ -2228,7 +2263,8 @@ NativeAuthResponse PostTokenGrant(
         response = session.Request(
             "POST",
             kTokenEndpoint,
-            BuildNvidiaAuthHeaders({}, "application/x-www-form-urlencoded; charset=UTF-8"),
+            BuildAuthHeadersForTokens(
+                tokens, {}, "application/x-www-form-urlencoded; charset=UTF-8"),
             body);
         const bool temporary = auth::IsTemporaryHttpStatus(response.status_code);
         if (response.status_code == 200 || !temporary || attempt == 3)
@@ -2254,10 +2290,11 @@ AuthTokens RefreshTokensWithClientTokenNative(const AuthSession& auth_session)
     const std::string body =
         "grant_type=" + UrlEncode("urn:ietf:params:oauth:grant-type:client_token", true) +
         "&client_token=" + UrlEncode(auth_session.tokens.client_token, true) +
-        "&client_id=" + UrlEncode(kClientId, true) +
+        "&client_id=" + UrlEncode(AuthClientIdFor(auth_session.tokens), true) +
         "&sub=" + UrlEncode(auth_session.user.user_id, true);
 
-    const NativeAuthResponse response = PostTokenGrant(session, body, "client-token refresh");
+    const NativeAuthResponse response =
+        PostTokenGrant(session, auth_session.tokens, body, "client-token refresh");
     if (response.status_code != 200)
     {
         AppendAuthLog(
@@ -2287,9 +2324,10 @@ AuthTokens RefreshTokensWithOAuthNative(const AuthSession& auth_session)
     const std::string body =
         "grant_type=refresh_token"
         "&refresh_token=" + UrlEncode(auth_session.tokens.refresh_token, true) +
-        "&client_id=" + UrlEncode(kClientId, true);
+        "&client_id=" + UrlEncode(AuthClientIdFor(auth_session.tokens), true);
 
-    const NativeAuthResponse response = PostTokenGrant(session, body, "OAuth refresh");
+    const NativeAuthResponse response =
+        PostTokenGrant(session, auth_session.tokens, body, "OAuth refresh");
 
     if (response.status_code != 200)
     {
@@ -2368,7 +2406,8 @@ void RequestClientToken(NativeAuthHttpSession& session, AuthTokens& tokens)
     if (tokens.access_token.empty())
         return;
     const NativeAuthResponse response = session.Request(
-        "GET", kClientTokenEndpoint, BuildNvidiaAuthHeaders(tokens.access_token));
+        "GET", kClientTokenEndpoint,
+        BuildAuthHeadersForTokens(tokens, tokens.access_token, {}));
     if (response.status_code != 200)
     {
         AppendAuthLog(
@@ -2395,7 +2434,7 @@ AuthUser FetchUserInfo(NativeAuthHttpSession& session, const AuthTokens& tokens)
     const NativeAuthResponse response = session.Request(
         "GET",
         kUserInfoEndpoint,
-        BuildNvidiaAuthHeaders(tokens.access_token, {}, false, "application/json"));
+        BuildAuthHeadersForTokens(tokens, tokens.access_token, {}, "application/json"));
     if (response.status_code != 200)
         throw std::runtime_error(
             "Failed to fetch user info with HTTP " + std::to_string(response.status_code));

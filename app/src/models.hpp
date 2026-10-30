@@ -22,6 +22,9 @@ struct AuthTokens
     std::string refresh_token;
     std::string id_token;
     std::string client_token;
+    // OAuth client that issued these tokens (OpenNOW's QR login uses its own
+    // device client); refreshes must present the same client id.
+    std::string auth_client_id;
     std::int64_t expires_at_ms              = 0;
     std::int64_t client_token_expires_at_ms = 0;
 };
