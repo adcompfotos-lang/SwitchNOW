@@ -813,6 +813,7 @@ bool ParseSessionObject(json_t* root, AuthSession& session)
     session.tokens.refresh_token = GetString(tokens, "refresh_token");
     session.tokens.id_token      = GetString(tokens, "id_token");
     session.tokens.client_token  = GetString(tokens, "client_token");
+    session.tokens.auth_client_id = GetString(tokens, "auth_client_id");
 
     json_t* expires = tokens ? json_object_get(tokens, "expires_at_ms") : nullptr;
     if (json_is_integer(expires))
@@ -897,6 +898,8 @@ JsonPtr BuildSessionObject(const AuthSession& session)
     json_object_set_new(tokens.get(), "refresh_token", json_string(session.tokens.refresh_token.c_str()));
     json_object_set_new(tokens.get(), "id_token", json_string(session.tokens.id_token.c_str()));
     json_object_set_new(tokens.get(), "client_token", json_string(session.tokens.client_token.c_str()));
+    json_object_set_new(
+        tokens.get(), "auth_client_id", json_string(session.tokens.auth_client_id.c_str()));
     json_object_set_new(tokens.get(), "expires_at_ms", json_integer(session.tokens.expires_at_ms));
     json_object_set_new(
         tokens.get(),
