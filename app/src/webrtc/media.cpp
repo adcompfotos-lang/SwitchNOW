@@ -108,7 +108,7 @@ void WebRtcSession::decoder_loop() {
 
 void WebRtcSession::recycle_decode_buffer_locked(std::vector<uint8_t>&& buffer) {
     constexpr size_t kPoolLimit = 8;
-    constexpr size_t kMaximumReusableCapacity = 2 * 1024 * 1024;
+    constexpr size_t kMaximumReusableCapacity = 4 * 1024 * 1024;
     if (decoder_buffer_pool_.size() >= kPoolLimit ||
         buffer.capacity() > kMaximumReusableCapacity) {
         return;

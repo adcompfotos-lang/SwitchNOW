@@ -516,10 +516,16 @@ std::string BuildNvstSdp(
     const std::string ice_pwd = ExtractSdpValue(answer_sdp, "a=ice-pwd:");
     const std::string fingerprint = ExtractSdpValue(answer_sdp, "a=fingerprint:sha-256 ");
     const auto tuning = opennow::video::ResolveQualityTuning(settings.image_quality_mode);
+    // Above 25 Mbps keep the floor and the start point of the 25 Mbps profile, so
+    // the server can still fall back when Wi-Fi cannot carry the peak.
+    constexpr int kMaxFloorKbps = 12500;
+    constexpr int kMaxInitialKbps = 22000;
     const int min_bitrate = std::max(
-        5000, (settings.bitrate_kbps * tuning.minimum_bitrate_percent) / 100);
+        5000, std::min(kMaxFloorKbps,
+                       (settings.bitrate_kbps * tuning.minimum_bitrate_percent) / 100));
     const int initial_bitrate = std::max(
-        min_bitrate, (settings.bitrate_kbps * tuning.initial_bitrate_percent) / 100);
+        min_bitrate, std::min(kMaxInitialKbps,
+                              (settings.bitrate_kbps * tuning.initial_bitrate_percent) / 100));
 
     std::vector<std::string> lines = {
         "v=0",
