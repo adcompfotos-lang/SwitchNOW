@@ -26,7 +26,8 @@ extern "C" {
 //#else
 //#define DECODER_BUFFER_SIZE 92 * 1024 * 2
 //#endif
-#define DECODER_BUFFER_SIZE (1024 * 1024)
+// Keyframes at 50-75 Mbps can exceed 1 MB; 4 MB covers a raw 1080p NV12 frame.
+#define DECODER_BUFFER_SIZE (4 * 1024 * 1024)
 
 #if defined(PLATFORM_ANDROID)
 #include <jni.h>
